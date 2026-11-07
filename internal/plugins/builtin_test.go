@@ -161,3 +161,17 @@ func TestDefaultTabsServicePlus(t *testing.T) {
 		t.Fatalf("no Database tab references tenant_migrations: %+v", dbTabs)
 	}
 }
+
+func TestFilterSafeRelRejectsInjection(t *testing.T) {
+	in := []string{"services/api", "apps/web", "foo;rm -rf ~", "$(evil)", "a b", "../escape", "ok-1.2", "`x`"}
+	got := filterSafeRel(in)
+	want := map[string]bool{"services/api": true, "apps/web": true, "ok-1.2": true}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d safe paths, got %v", len(want), got)
+	}
+	for _, g := range got {
+		if !want[g] {
+			t.Fatalf("unexpected kept path %q in %v", g, got)
+		}
+	}
+}

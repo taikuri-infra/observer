@@ -4,11 +4,32 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/taikuri-infra/observer/internal/manifest"
 )
+
+// safeRelPathRe allows only characters that cannot alter shell parsing, so
+// auto-detected repo directory names are safe to interpolate into the tab
+// commands below (which the runner executes via `sh -c`). A hostile repo could
+// otherwise ship a directory named e.g. `$(…)` or `;rm -rf ~` and get code
+// execution at `init`/analysis time.
+var safeRelPathRe = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+
+// filterSafeRel drops any detected path with shell metacharacters, whitespace,
+// or "..". Real source directories are always within the allowed charset;
+// anything else is pathological (or hostile) and is skipped.
+func filterSafeRel(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p != "" && safeRelPathRe.MatchString(p) && !strings.Contains(p, "..") {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 // DefaultTabs detects repo's structure and returns observer's built-in tab
 // set: Overview + Changes (always), Database (per detected SQL migrations
@@ -30,6 +51,8 @@ func DefaultTabs(repo string) ([]manifest.Tab, error) {
 		return nil, fmt.Errorf("detect frontend packages: %w", err)
 	}
 	frontendModules = excludeTestDirs(frontendModules)
+	goModules = filterSafeRel(goModules)
+	frontendModules = filterSafeRel(frontendModules)
 
 	tabs := []manifest.Tab{overviewTab(), changesTab()}
 
@@ -44,6 +67,7 @@ func DefaultTabs(repo string) ([]manifest.Tab, error) {
 		}
 	}
 	sort.Strings(migrationsDirs)
+	migrationsDirs = filterSafeRel(migrationsDirs)
 
 	tabs = append(tabs, databaseTabs(migrationsDirs)...)
 	tabs = append(tabs, goDepsTabs(goModules)...)
@@ -105,7 +129,7 @@ func databaseTabs(migrationsDirs []string) []manifest.Tab {
 			Name: tabName("Database", filepath.Base(dir), len(migrationsDirs)),
 			Kind: manifest.KindGenerator,
 			Command: fmt.Sprintf(
-				"observer gen er --migrations %s --out obs-data/%s --dbml-out obs-data/%s",
+				"observer gen er --migrations '%s' --out 'obs-data/%s' --dbml-out 'obs-data/%s'",
 				dir, mmd, dbml,
 			),
 			Output:   mmd,
@@ -126,7 +150,7 @@ func goDepsTabs(goModules []string) []manifest.Tab {
 		tabs = append(tabs, manifest.Tab{
 			Name:     tabName("Go deps", mod, len(goModules)),
 			Kind:     manifest.KindGenerator,
-			Command:  fmt.Sprintf("observer gen godeps --dir . --out %sobs-data/%s", upPath(mod), out),
+			Command:  fmt.Sprintf("observer gen godeps --dir . --out '%sobs-data/%s'", upPath(mod), out),
 			Output:   out,
 			Dir:      mod,
 			Renderer: "graph",
@@ -145,7 +169,7 @@ func goCallGraphTabs(goModules []string) []manifest.Tab {
 		tabs = append(tabs, manifest.Tab{
 			Name:     tabName("Go call graph", mod, len(goModules)),
 			Kind:     manifest.KindGenerator,
-			Command:  fmt.Sprintf("go-callvis -format svg -file %sobs-data/%s -nostd ./...", upPath(mod), stem),
+			Command:  fmt.Sprintf("go-callvis -format svg -file '%sobs-data/%s' -nostd ./...", upPath(mod), stem),
 			Output:   out,
 			Dir:      mod,
 			Renderer: "svg",
@@ -169,7 +193,7 @@ func frontendDepsTabs(repo string, frontendModules []string) []manifest.Tab {
 		tabs = append(tabs, manifest.Tab{
 			Name:     tabName("Frontend deps", mod, len(frontendModules)),
 			Kind:     manifest.KindGenerator,
-			Command:  fmt.Sprintf("depcruise --no-config --output-type dot %s > %sobs-data/%s", src, upPath(mod), out),
+			Command:  fmt.Sprintf("depcruise --no-config --output-type dot '%s' > '%sobs-data/%s'", src, upPath(mod), out),
 			Output:   out,
 			Dir:      mod,
 			Renderer: "graph",
