@@ -1,0 +1,32 @@
+#!/bin/sh
+# observer — thin Docker wrapper. Mounts the current directory as the repo
+# to observe and runs the polyglot observer image against it. The only
+# host dependency is Docker; everything else (go toolchain, go-callvis,
+# node, dependency-cruiser, graphviz) lives inside the image.
+#
+# R4:  publish on 127.0.0.1 only — never expose the dashboard (and its
+#      shell-executing POST /api/update) on all interfaces.
+# R14: no `-it` — `docker run` fails outside a TTY (CI, scripts, `sh -c`).
+#      Attach a TTY only when stdin/stdout are actually a terminal.
+set -eu
+
+IMAGE="${OBSERVER_IMAGE:-ghcr.io/taikuri-infra/observer:latest}"
+
+tty_flags=""
+if [ -t 1 ]; then
+  tty_flags="-it"
+fi
+
+# `observer up` is the friendly alias for `serve`.
+if [ "${1:-}" = "up" ]; then
+  shift
+  set -- serve --repo /work --addr 0.0.0.0 --port 7979 "$@"
+fi
+
+# shellcheck disable=SC2086
+exec docker run --rm $tty_flags \
+  -p 127.0.0.1:7979:7979 \
+  -u "$(id -u):$(id -g)" \
+  -v "$PWD:/work" \
+  -v observer-gocache:/go \
+  "$IMAGE" "$@"
