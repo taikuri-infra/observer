@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Observer</title>
+<link rel="stylesheet" href="/web/style.css" />
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="brand">
+      <span class="brand-mark">&#9678;</span>
+      <span class="brand-name">Observer</span>
+    </div>
+    <div class="project-name" id="project-name">loading&hellip;</div>
+    <nav class="tabs" id="tabs" aria-label="Tabs"></nav>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <h1 class="tab-title" id="tab-title">&mdash;</h1>
+      <div class="topbar-actions">
+        <span class="freshness" id="freshness"></span>
+        <button class="btn btn-primary" id="update-btn" disabled>Update</button>
+      </div>
+    </header>
+    <section class="content" id="content">
+      <p class="empty">Select a tab on the left to get started.</p>
+    </section>
+  </main>
+</div>
+
+<script src="/web/vendor/marked.min.js"></script>
+<script src="/web/vendor/mermaid.min.js"></script>
+<script src="/web/vendor/viz-standalone.js"></script>
+<script src="/web/app.js"></script>
+</body>
+</html>

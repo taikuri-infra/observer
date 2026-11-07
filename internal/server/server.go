@@ -4,18 +4,27 @@
 package server
 
 import (
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/taikuri-infra/observer/internal/manifest"
 	"github.com/taikuri-infra/observer/internal/runner"
 )
+
+// webFS embeds the entire dashboard UI (HTML/CSS/JS + vendored renderer
+// libs) into the binary — no external assets, no build step (M2).
+//
+//go:embed web/*
+var webFS embed.FS
 
 const (
 	obsDataDir  = "obs-data"
@@ -45,15 +54,67 @@ func New(repo, base string) http.Handler {
 	mux.HandleFunc("/api/project", s.handleProject)
 	mux.HandleFunc("/api/update", s.handleUpdate)
 	mux.HandleFunc("/api/artifact", s.handleArtifact)
+	mux.HandleFunc("/web/", s.handleWebAsset)
 	mux.HandleFunc("/", s.handleIndex)
 	return mux
 }
 
-// handleIndex serves the dashboard shell. Real UI ships in M2; for M1 this
-// is a placeholder so the route exists end-to-end.
+// handleIndex serves the dashboard shell (web/index.html) at the root path.
+// Any other unmatched path is a 404 (the ServeMux routes /web/* and /api/*
+// elsewhere first).
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprintf(w, "observer — dashboard UI not yet implemented (M2). API: /api/project, /api/update, /api/artifact.\n")
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	serveEmbedded(w, r, "web/index.html")
+}
+
+// handleWebAsset serves everything under the embedded web/ tree (app.js,
+// style.css, vendor/*) at /web/*.
+func (s *Server) handleWebAsset(w http.ResponseWriter, r *http.Request) {
+	// r.URL.Path is "/web/app.js"; the embedded FS root is "web", so strip
+	// the leading "/web" before rejoining under "web/".
+	rel := strings.TrimPrefix(r.URL.Path, "/web")
+	serveEmbedded(w, r, "web"+rel)
+}
+
+// serveEmbedded reads name from the embedded web FS and writes it with a
+// Content-Type derived from the file extension (R8-style explicit mapping —
+// not left to the OS mime database, so behavior is identical across hosts).
+func serveEmbedded(w http.ResponseWriter, r *http.Request, name string) {
+	// path.Clean collapses any "../" so a request can never escape the
+	// embedded web/ tree; fs.ReadFile also rejects ".." outright.
+	clean := path.Clean(name)
+	data, err := webFS.ReadFile(clean)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", webContentType(clean))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+// webContentType maps a file extension to the Content-Type the dashboard
+// expects, independent of the host's mime database.
+func webContentType(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".html":
+		return "text/html; charset=utf-8"
+	case ".js":
+		return "text/javascript; charset=utf-8"
+	case ".css":
+		return "text/css; charset=utf-8"
+	case ".svg":
+		return "image/svg+xml"
+	case ".json":
+		return "application/json; charset=utf-8"
+	case ".map":
+		return "application/json; charset=utf-8"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 func (s *Server) loadManifest() (*manifest.Project, error) {

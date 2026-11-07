@@ -110,7 +110,7 @@ func TestUpdateUnknownTab(t *testing.T) {
 	}
 }
 
-func TestIndexPlaceholder(t *testing.T) {
+func TestIndexServesDashboardHTML(t *testing.T) {
 	repo := initRepo(t)
 	writeManifest(t, repo)
 	h := New(repo, "main")
@@ -121,7 +121,42 @@ func TestIndexPlaceholder(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("index status = %d", rec.Code)
 	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("content-type = %q", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "Observer") {
+		t.Fatalf("expected dashboard HTML to contain a known marker, got: %s", rec.Body.String())
+	}
+}
+
+func TestWebAssetServesJS(t *testing.T) {
+	repo := initRepo(t)
+	writeManifest(t, repo)
+	h := New(repo, "main")
+
+	req := httptest.NewRequest(http.MethodGet, "/web/app.js", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("web asset status = %d body=%s", rec.Code, rec.Body)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/javascript") {
+		t.Fatalf("content-type = %q", ct)
+	}
 	if rec.Body.Len() == 0 {
-		t.Fatal("expected non-empty placeholder body")
+		t.Fatal("expected non-empty app.js body")
+	}
+}
+
+func TestWebAssetUnknownPath404s(t *testing.T) {
+	repo := initRepo(t)
+	writeManifest(t, repo)
+	h := New(repo, "main")
+
+	req := httptest.NewRequest(http.MethodGet, "/web/does-not-exist.js", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rec.Code)
 	}
 }
