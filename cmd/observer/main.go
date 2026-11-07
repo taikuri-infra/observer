@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
@@ -55,6 +56,9 @@ Usage:
   observer serve [--repo .] [--base main] [--addr 127.0.0.1] [--port 7979]
   observer gen changes --base main --out <path> [--repo .]
   observer gen er --migrations <dir> --out <er.mmd> --dbml-out <er.dbml> [--repo .]
+  observer gen godeps --dir <moduleDir> --out <godeps.dot> [--repo .]
+  observer gen hotspots --out <hotspots.json> [--repo .] [--since <ref>]
+  observer gen overview --out <index.md> [--repo .] [--base main]
   observer init [--repo .]
   observer doctor
   observer version
@@ -96,8 +100,14 @@ func runGen(args []string) error {
 		return runGenChanges(args[1:])
 	case "er":
 		return runGenER(args[1:])
+	case "godeps":
+		return runGenGoDeps(args[1:])
+	case "hotspots":
+		return runGenHotspots(args[1:])
+	case "overview":
+		return runGenOverview(args[1:])
 	default:
-		return fmt.Errorf("gen: unknown generator %q (available: changes, er)", args[0])
+		return fmt.Errorf("gen: unknown generator %q (available: changes, er, godeps, hotspots, overview)", args[0])
 	}
 }
 
@@ -156,6 +166,87 @@ func runGenER(args []string) error {
 		return err
 	}
 	return writeOut(absRepo, *dbmlOut, dbml)
+}
+
+// runGenGoDeps wires gen.GoDeps: --dir is the Go module directory (relative
+// to --repo unless absolute), --out is where the DOT graph is written.
+func runGenGoDeps(args []string) error {
+	fs := flag.NewFlagSet("gen godeps", flag.ExitOnError)
+	repo := fs.String("repo", ".", "path to the repo")
+	dir := fs.String("dir", ".", "path to the Go module directory (relative to --repo unless absolute)")
+	out := fs.String("out", "", "output file path (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("gen godeps: --out is required")
+	}
+	absRepo, err := absPath(*repo)
+	if err != nil {
+		return err
+	}
+	absDir := *dir
+	if !filepath.IsAbs(absDir) {
+		absDir = filepath.Join(absRepo, absDir)
+	}
+	dot, err := gen.GoDeps(absDir)
+	if err != nil {
+		return fmt.Errorf("gen godeps: %w", err)
+	}
+	return writeOut(absRepo, *out, dot)
+}
+
+// runGenHotspots wires gen.Hotspots: aggregates git log --numstat churn per
+// file and writes the top files as JSON.
+func runGenHotspots(args []string) error {
+	fs := flag.NewFlagSet("gen hotspots", flag.ExitOnError)
+	repo := fs.String("repo", ".", "path to the repo")
+	since := fs.String("since", "", "only consider commits since this git ref/date (optional)")
+	top := fs.Int("top", 50, "max number of files to report, by churn")
+	out := fs.String("out", "", "output file path (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("gen hotspots: --out is required")
+	}
+	absRepo, err := absPath(*repo)
+	if err != nil {
+		return err
+	}
+	stats, err := gen.Hotspots(absRepo, *since, *top)
+	if err != nil {
+		return fmt.Errorf("gen hotspots: %w", err)
+	}
+	b, err := json.MarshalIndent(stats, "", "  ")
+	if err != nil {
+		return fmt.Errorf("gen hotspots: marshal: %w", err)
+	}
+	return writeOut(absRepo, *out, string(b))
+}
+
+// runGenOverview wires gen.Overview: a markdown landing-page summary of repo
+// freshness + the tab/artifact inventory from obs-data/_index.json.
+func runGenOverview(args []string) error {
+	fs := flag.NewFlagSet("gen overview", flag.ExitOnError)
+	repo := fs.String("repo", ".", "path to the repo")
+	base := fs.String("base", "main", "branch to compare against for freshness")
+	out := fs.String("out", "", "output file path (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("gen overview: --out is required")
+	}
+	absRepo, err := absPath(*repo)
+	if err != nil {
+		return err
+	}
+	md, err := gen.Overview(absRepo, *base)
+	if err != nil {
+		return fmt.Errorf("gen overview: %w", err)
+	}
+	return writeOut(absRepo, *out, md)
 }
 
 func writeOut(repo, out, content string) error {
