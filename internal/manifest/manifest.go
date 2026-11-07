@@ -19,21 +19,21 @@ const (
 
 // Tab is one entry in observer.yaml — one tab in the dashboard.
 type Tab struct {
-	Name     string   `yaml:"name"`
-	Kind     Kind     `yaml:"kind"`
-	Command  string   `yaml:"command"`            // generator
-	Output   string   `yaml:"output"`             // generator: file under obs-data/
-	Dir      string   `yaml:"dir,omitempty"`      // generator: subdir (relative to repo) to run the command in
-	Renderer string   `yaml:"renderer"`           // markdown|svg|mermaid|dbml|graph|table
-	Requires []string `yaml:"requires,omitempty"` // external tools needed
-	URL      string   `yaml:"url,omitempty"`      // service/link
-	Start    string   `yaml:"start,omitempty"`    // service
+	Name     string   `yaml:"name" json:"name"`
+	Kind     Kind     `yaml:"kind" json:"kind"`
+	Command  string   `yaml:"command" json:"command,omitempty"`             // generator
+	Output   string   `yaml:"output" json:"output,omitempty"`               // generator: file under obs-data/
+	Dir      string   `yaml:"dir,omitempty" json:"dir,omitempty"`           // generator: subdir (relative to repo) to run the command in
+	Renderer string   `yaml:"renderer" json:"renderer,omitempty"`           // markdown|svg|mermaid|dbml|graph|table
+	Requires []string `yaml:"requires,omitempty" json:"requires,omitempty"` // external tools needed
+	URL      string   `yaml:"url,omitempty" json:"url,omitempty"`           // service/link
+	Start    string   `yaml:"start,omitempty" json:"start,omitempty"`       // service
 }
 
 // Project is the top-level observer.yaml document.
 type Project struct {
-	Project string `yaml:"project"`
-	Tabs    []Tab  `yaml:"tabs"`
+	Project string `yaml:"project" json:"project"`
+	Tabs    []Tab  `yaml:"tabs" json:"tabs"`
 }
 
 // Parse decodes and validates an observer.yaml document.

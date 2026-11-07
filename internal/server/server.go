@@ -1,0 +1,247 @@
+// Package server implements observer's HTTP API: the dashboard reads the
+// repo's manifest and artifact freshness, triggers a tab's generator, and
+// fetches a rendered artifact.
+package server
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/taikuri-infra/observer/internal/manifest"
+	"github.com/taikuri-infra/observer/internal/runner"
+)
+
+const (
+	obsDataDir  = "obs-data"
+	manifestRel = "observer.yaml"
+	indexRel    = "_index.json"
+)
+
+// index is the obs-data/_index.json schema (R7): freshness per tab, keyed by
+// tab name.
+type index struct {
+	Tabs map[string]runner.Artifact `json:"tabs"`
+}
+
+// Server holds the per-repo state the API operates on. Safe for concurrent
+// use: writes to _index.json are serialized by mu.
+type Server struct {
+	repo string
+	base string
+	mu   sync.Mutex
+}
+
+// New builds the observer HTTP handler for one repo. base is the branch
+// tabs' "changes since" diffs are compared against (e.g. "main").
+func New(repo, base string) http.Handler {
+	s := &Server{repo: repo, base: base}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/project", s.handleProject)
+	mux.HandleFunc("/api/update", s.handleUpdate)
+	mux.HandleFunc("/api/artifact", s.handleArtifact)
+	mux.HandleFunc("/", s.handleIndex)
+	return mux
+}
+
+// handleIndex serves the dashboard shell. Real UI ships in M2; for M1 this
+// is a placeholder so the route exists end-to-end.
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintf(w, "observer — dashboard UI not yet implemented (M2). API: /api/project, /api/update, /api/artifact.\n")
+}
+
+func (s *Server) loadManifest() (*manifest.Project, error) {
+	b, err := os.ReadFile(filepath.Join(s.repo, obsDataDir, manifestRel))
+	if err != nil {
+		return nil, fmt.Errorf("read %s/%s: %w", obsDataDir, manifestRel, err)
+	}
+	return manifest.Parse(b)
+}
+
+func (s *Server) loadIndex() (index, error) {
+	idx := index{Tabs: map[string]runner.Artifact{}}
+	b, err := os.ReadFile(filepath.Join(s.repo, obsDataDir, indexRel))
+	if errors.Is(err, os.ErrNotExist) {
+		return idx, nil
+	}
+	if err != nil {
+		return idx, err
+	}
+	if err := json.Unmarshal(b, &idx); err != nil {
+		return idx, err
+	}
+	if idx.Tabs == nil {
+		idx.Tabs = map[string]runner.Artifact{}
+	}
+	return idx, nil
+}
+
+// saveIndex writes _index.json atomically (write a temp file, then rename).
+func (s *Server) saveIndex(idx index) error {
+	b, err := json.MarshalIndent(idx, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(s.repo, obsDataDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	final := filepath.Join(dir, indexRel)
+	tmp := final + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, final)
+}
+
+type projectResponse struct {
+	Project string                     `json:"project"`
+	Tabs    []manifest.Tab             `json:"tabs"`
+	Status  map[string]runner.Artifact `json:"status"` // per-tab last-run freshness, by tab name
+}
+
+func (s *Server) handleProject(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	proj, err := s.loadManifest()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.mu.Lock()
+	idx, err := s.loadIndex()
+	s.mu.Unlock()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	resp := projectResponse{Project: proj.Project, Tabs: proj.Tabs, Status: idx.Tabs}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleUpdate runs the named tab's generator command and records the
+// resulting artifact in _index.json. R15: requires the X-Observer: 1 header
+// so a page loaded from another origin can't drive-by POST a shell command
+// into this repo.
+func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.Header.Get("X-Observer") != "1" {
+		http.Error(w, "missing required X-Observer header", http.StatusForbidden)
+		return
+	}
+	tabName := r.URL.Query().Get("tab")
+	if tabName == "" {
+		http.Error(w, "missing required ?tab= query param", http.StatusBadRequest)
+		return
+	}
+	proj, err := s.loadManifest()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	tab, ok := findTab(proj, tabName)
+	if !ok {
+		http.Error(w, fmt.Sprintf("unknown tab %q", tabName), http.StatusNotFound)
+		return
+	}
+
+	artifact, runErr := runner.Run(r.Context(), s.repo, s.base, tab, time.Now())
+
+	s.mu.Lock()
+	idx, err := s.loadIndex()
+	if err == nil {
+		idx.Tabs[tab.Name] = artifact
+		err = s.saveIndex(idx)
+	}
+	s.mu.Unlock()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if runErr != nil {
+		writeJSON(w, http.StatusInternalServerError, artifact)
+		return
+	}
+	writeJSON(w, http.StatusOK, artifact)
+}
+
+// handleArtifact serves the raw artifact file for a tab, with Content-Type
+// derived from the tab's renderer (R8).
+func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	tabName := r.URL.Query().Get("tab")
+	if tabName == "" {
+		http.Error(w, "missing required ?tab= query param", http.StatusBadRequest)
+		return
+	}
+	proj, err := s.loadManifest()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	tab, ok := findTab(proj, tabName)
+	if !ok {
+		http.Error(w, fmt.Sprintf("unknown tab %q", tabName), http.StatusNotFound)
+		return
+	}
+	path := filepath.Join(s.repo, obsDataDir, tab.Output)
+	body, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			http.Error(w, "artifact not generated yet — run Update first", http.StatusNotFound)
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeFor(tab.Renderer))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+func contentTypeFor(renderer string) string {
+	switch renderer {
+	case "svg":
+		return "image/svg+xml"
+	case "markdown":
+		return "text/markdown; charset=utf-8"
+	case "json", "table":
+		return "application/json"
+	default:
+		return "text/plain; charset=utf-8"
+	}
+}
+
+func findTab(proj *manifest.Project, name string) (manifest.Tab, bool) {
+	for _, t := range proj.Tabs {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return manifest.Tab{}, false
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, err error) {
+	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
