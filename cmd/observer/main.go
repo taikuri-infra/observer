@@ -6,12 +6,18 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/taikuri-infra/observer/internal/gen"
+	"github.com/taikuri-infra/observer/internal/manifest"
+	"github.com/taikuri-infra/observer/internal/plugins"
 	"github.com/taikuri-infra/observer/internal/server"
 )
 
@@ -59,8 +65,8 @@ Usage:
   observer gen godeps --dir <moduleDir> --out <godeps.dot> [--repo .]
   observer gen hotspots --out <hotspots.json> [--repo .] [--since <ref>]
   observer gen overview --out <index.md> [--repo .] [--base main]
-  observer init [--repo .]
-  observer doctor
+  observer init [--repo .] [--out <path>]
+  observer doctor [--repo .]
   observer version
 `)
 }
@@ -264,11 +270,69 @@ func absPath(p string) (string, error) {
 	return filepath.Abs(p)
 }
 
-// runInit scaffolds obs-data/observer.yaml. Full language-detection
-// (DefaultTabs) ships in M3 — for M1 this just makes sure the command
-// exists per R13 and reports what it would do.
+// runInit scaffolds obs-data/observer.yaml from plugins.DefaultTabs.
+// Idempotent: never clobbers an existing manifest. --out overrides the
+// destination, e.g. for writing to a temp location without touching the
+// target repo's obs-data/ (used by M3's acceptance check).
 func runInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	repo := fs.String("repo", ".", "path to the repo")
+	out := fs.String("out", "", "write the manifest here instead of <repo>/obs-data/observer.yaml")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	absRepo, err := absPath(*repo)
+	if err != nil {
+		return err
+	}
+	manifestPath := *out
+	if manifestPath == "" {
+		manifestPath = filepath.Join(absRepo, "obs-data", "observer.yaml")
+	}
+	wrote, tabs, err := writeManifestIfAbsent(absRepo, manifestPath)
+	if err != nil {
+		return fmt.Errorf("init: %w", err)
+	}
+	if !wrote {
+		fmt.Printf("observer.yaml already exists at %s — leaving it untouched\n", manifestPath)
+		return nil
+	}
+	fmt.Printf("wrote %s (%d tabs)\n", manifestPath, len(tabs))
+	return nil
+}
+
+// writeManifestIfAbsent detects repo's default tabs and writes them as
+// YAML to manifestPath, unless manifestPath already exists. Returns
+// whether it wrote the file (false means "left untouched").
+func writeManifestIfAbsent(repo, manifestPath string) (wrote bool, tabs []manifest.Tab, err error) {
+	if _, statErr := os.Stat(manifestPath); statErr == nil {
+		return false, nil, nil
+	} else if !os.IsNotExist(statErr) {
+		return false, nil, statErr
+	}
+	tabs, err = plugins.DefaultTabs(repo)
+	if err != nil {
+		return false, nil, fmt.Errorf("detect default tabs: %w", err)
+	}
+	proj := manifest.Project{Project: filepath.Base(repo), Tabs: tabs}
+	b, err := yaml.Marshal(proj)
+	if err != nil {
+		return false, nil, fmt.Errorf("marshal manifest: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
+		return false, nil, err
+	}
+	if err := os.WriteFile(manifestPath, b, 0o644); err != nil {
+		return false, nil, err
+	}
+	return true, tabs, nil
+}
+
+// runDoctor loads the repo's manifest (or detects plugins.DefaultTabs if
+// none exists yet) and reports git's availability plus, for every distinct
+// external tool any tab Requires, whether it's found on PATH.
+func runDoctor(args []string) error {
+	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
 	repo := fs.String("repo", ".", "path to the repo")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -277,24 +341,57 @@ func runInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	manifestPath := filepath.Join(absRepo, "obs-data", "observer.yaml")
-	if _, err := os.Stat(manifestPath); err == nil {
-		fmt.Printf("observer.yaml already exists at %s — leaving it untouched\n", manifestPath)
-		return nil
+	tabs, err := loadOrDetectTabs(absRepo)
+	if err != nil {
+		return fmt.Errorf("doctor: %w", err)
 	}
-	fmt.Println("observer init: default-tab detection ships in M3; create obs-data/observer.yaml by hand for now")
-	return nil
+	return printDoctorReport(os.Stdout, tabs)
 }
 
-// runDoctor is a stub in M1 (full tool-presence checks ship with M3's
-// DefaultTabs); for now it just confirms git is reachable, since every
-// generator in this milestone depends on it.
-func runDoctor(_ []string) error {
-	_, err := exec.LookPath("git")
-	if err != nil {
-		fmt.Println("git: NOT FOUND on PATH (required)")
-		return err
+// loadOrDetectTabs reads repo's obs-data/observer.yaml if present,
+// otherwise falls back to plugins.DefaultTabs so `doctor` is useful even
+// before `init` has ever run.
+func loadOrDetectTabs(repo string) ([]manifest.Tab, error) {
+	b, err := os.ReadFile(filepath.Join(repo, "obs-data", "observer.yaml"))
+	if err == nil {
+		proj, perr := manifest.Parse(b)
+		if perr != nil {
+			return nil, fmt.Errorf("parse %s: %w", filepath.Join(repo, "obs-data", "observer.yaml"), perr)
+		}
+		return proj.Tabs, nil
 	}
-	fmt.Println("git: ok")
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+	return plugins.DefaultTabs(repo)
+}
+
+// printDoctorReport writes git's availability, plus every distinct
+// external tool required by tabs and whether exec.LookPath finds it, to w.
+func printDoctorReport(w io.Writer, tabs []manifest.Tab) error {
+	if _, err := exec.LookPath("git"); err != nil {
+		fmt.Fprintln(w, "git: NOT FOUND on PATH (required)")
+	} else {
+		fmt.Fprintln(w, "git: ok")
+	}
+
+	seen := map[string]bool{}
+	var tools []string
+	for _, t := range tabs {
+		for _, tool := range t.Requires {
+			if !seen[tool] {
+				seen[tool] = true
+				tools = append(tools, tool)
+			}
+		}
+	}
+	sort.Strings(tools)
+	for _, tool := range tools {
+		if _, err := exec.LookPath(tool); err != nil {
+			fmt.Fprintf(w, "%s: NOT FOUND on PATH\n", tool)
+		} else {
+			fmt.Fprintf(w, "%s: ok\n", tool)
+		}
+	}
 	return nil
 }
