@@ -4,6 +4,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -41,33 +42,64 @@ type index struct {
 // Server holds the per-repo state the API operates on. Safe for concurrent
 // use: writes to _index.json are serialized by mu.
 type Server struct {
-	repo string
-	base string
-	mu   sync.Mutex
+	repo  string
+	base  string
+	token string
+	mu    sync.Mutex
 }
 
 // New builds the observer HTTP handler for one repo. base is the branch
-// tabs' "changes since" diffs are compared against (e.g. "main").
-func New(repo, base string) http.Handler {
-	s := &Server{repo: repo, base: base}
+// tabs' "changes since" diffs are compared against (e.g. "main"). token is
+// the per-session API bearer token (see cmd/observer's runServe): every
+// /api/* request must carry it as X-Observer-Token, since network
+// reachability of localhost must not be enough to trigger shell-exec
+// endpoints.
+func New(repo, base, token string) http.Handler {
+	s := &Server{repo: repo, base: base, token: token}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/project", s.handleProject)
-	mux.HandleFunc("/api/update", s.handleUpdate)
-	mux.HandleFunc("/api/artifact", s.handleArtifact)
+	mux.HandleFunc("/api/project", s.requireToken(s.handleProject))
+	mux.HandleFunc("/api/update", s.requireToken(s.handleUpdate))
+	mux.HandleFunc("/api/artifact", s.requireToken(s.handleArtifact))
 	mux.HandleFunc("/web/", s.handleWebAsset)
 	mux.HandleFunc("/", s.handleIndex)
 	return mux
 }
 
-// handleIndex serves the dashboard shell (web/index.html) at the root path.
-// Any other unmatched path is a 404 (the ServeMux routes /web/* and /api/*
-// elsewhere first).
+// requireToken wraps an /api/* handler so it 401s unless the request carries
+// X-Observer-Token matching s.token, compared in constant time so the
+// comparison itself can't leak the token via timing. s.token is always
+// non-empty (cmd/observer generates one if OBSERVER_TOKEN is unset), so an
+// empty header never matches.
+func (s *Server) requireToken(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		got := r.Header.Get("X-Observer-Token")
+		if s.token == "" || subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) != 1 {
+			http.Error(w, "missing or invalid X-Observer-Token", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// handleIndex serves the dashboard shell (web/index.html) at the root path,
+// with the __OBSERVER_TOKEN__ placeholder substituted for the real token so
+// the browser-side JS can read it from the meta tag and send it on every
+// /api/* request. Any other unmatched path is a 404 (the ServeMux routes
+// /web/* and /api/* elsewhere first).
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
-	serveEmbedded(w, r, "web/index.html")
+	data, err := webFS.ReadFile("web/index.html")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	html := strings.ReplaceAll(string(data), "__OBSERVER_TOKEN__", s.token)
+	w.Header().Set("Content-Type", webContentType("index.html"))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(html))
 }
 
 // handleWebAsset serves everything under the embedded web/ tree (app.js,

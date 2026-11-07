@@ -3,7 +3,9 @@
 // Flow: fetch /api/project -> populate the tab rail -> on tab click, fetch
 // /api/artifact?tab=NAME and render it per the tab's `renderer`. The Update
 // button POSTs /api/update?tab=NAME (with the required X-Observer header,
-// R15) then re-fetches the artifact.
+// R15) then re-fetches the artifact. Every /api/* request also carries
+// X-Observer-Token (read once from the server-embedded meta tag) since the
+// server requires it on all API routes.
 (function () {
   "use strict";
 
@@ -14,6 +16,14 @@
   };
 
   var mermaidCounter = 0;
+
+  // The server embeds a per-session token (OBSERVER_TOKEN) into the page via
+  // a meta tag; every /api/* request must carry it as X-Observer-Token or
+  // the server returns 401 (the API endpoints run shell commands).
+  var apiToken = (function () {
+    var meta = document.querySelector('meta[name="observer-token"]');
+    return meta ? meta.getAttribute("content") : "";
+  })();
 
   var els = {
     tabs: document.getElementById("tabs"),
@@ -35,7 +45,7 @@
   // ---- Data loading ----
 
   function loadProject() {
-    fetch("/api/project")
+    fetch("/api/project", { headers: { "X-Observer-Token": apiToken } })
       .then(function (r) {
         if (!r.ok) throw new Error("GET /api/project: " + r.status);
         return r.json();
@@ -141,7 +151,9 @@
 
   function loadArtifact(tab) {
     els.content.innerHTML = '<p class="empty">Loading&hellip;</p>';
-    fetch("/api/artifact?tab=" + encodeURIComponent(tab.name))
+    fetch("/api/artifact?tab=" + encodeURIComponent(tab.name), {
+      headers: { "X-Observer-Token": apiToken },
+    })
       .then(function (r) {
         if (r.status === 404) {
           els.content.innerHTML =
@@ -173,7 +185,7 @@
 
     fetch("/api/update?tab=" + encodeURIComponent(tab.name), {
       method: "POST",
-      headers: { "X-Observer": "1" },
+      headers: { "X-Observer": "1", "X-Observer-Token": apiToken },
     })
       .then(function (r) {
         return r.json().then(function (artifact) {

@@ -3,6 +3,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -87,10 +89,30 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	h := server.New(absRepo, *base)
+	token := os.Getenv("OBSERVER_TOKEN")
+	if token == "" {
+		token, err = generateToken()
+		if err != nil {
+			return fmt.Errorf("generate API token: %w", err)
+		}
+	}
+	h := server.New(absRepo, *base, token)
 	listenAddr := fmt.Sprintf("%s:%d", *addr, *port)
 	fmt.Printf("observer serving %s on http://%s (base=%s)\n", absRepo, listenAddr, *base)
+	fmt.Printf("Observer running: http://%s/?token=%s\n", listenAddr, token)
+	fmt.Printf("API token: %s\n", token)
 	return http.ListenAndServe(listenAddr, h)
+}
+
+// generateToken returns a 32-byte random token, hex-encoded, used as the
+// per-session bearer token for /api/* requests (OBSERVER_TOKEN overrides
+// this when set, e.g. for scripted/CI use).
+func generateToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // runGen invokes a native generator directly and writes its output (R2:

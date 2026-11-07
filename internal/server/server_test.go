@@ -10,6 +10,10 @@ import (
 	"testing"
 )
 
+// testToken is the fixed API bearer token used across tests (production
+// generates one randomly via crypto/rand — see cmd/observer).
+const testToken = "test-token-deadbeef"
+
 func initRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -50,9 +54,10 @@ tabs:
 func TestProjectUpdateArtifactFlow(t *testing.T) {
 	repo := initRepo(t)
 	writeManifest(t, repo)
-	h := New(repo, "main")
+	h := New(repo, "main", testToken)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/project", nil)
+	req.Header.Set("X-Observer-Token", testToken)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -62,16 +67,29 @@ func TestProjectUpdateArtifactFlow(t *testing.T) {
 		t.Fatalf("project body = %s", rec.Body)
 	}
 
-	// R15: POST without the X-Observer header must be rejected.
+	// R15: POST without the X-Observer header must be rejected, even with a
+	// valid token.
 	req = httptest.NewRequest(http.MethodPost, "/api/update?tab=Changes", nil)
+	req.Header.Set("X-Observer-Token", testToken)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 without X-Observer header, got %d body=%s", rec.Code, rec.Body)
 	}
 
+	// A valid token but missing X-Observer: 1 CSRF header still isn't
+	// enough — both are required.
 	req = httptest.NewRequest(http.MethodPost, "/api/update?tab=Changes", nil)
 	req.Header.Set("X-Observer", "1")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without X-Observer-Token, got %d body=%s", rec.Code, rec.Body)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/update?tab=Changes", nil)
+	req.Header.Set("X-Observer", "1")
+	req.Header.Set("X-Observer-Token", testToken)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -79,6 +97,7 @@ func TestProjectUpdateArtifactFlow(t *testing.T) {
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/artifact?tab=Changes", nil)
+	req.Header.Set("X-Observer-Token", testToken)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -99,10 +118,11 @@ func TestProjectUpdateArtifactFlow(t *testing.T) {
 func TestUpdateUnknownTab(t *testing.T) {
 	repo := initRepo(t)
 	writeManifest(t, repo)
-	h := New(repo, "main")
+	h := New(repo, "main", testToken)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/update?tab=Nope", nil)
 	req.Header.Set("X-Observer", "1")
+	req.Header.Set("X-Observer-Token", testToken)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
@@ -110,10 +130,43 @@ func TestUpdateUnknownTab(t *testing.T) {
 	}
 }
 
+// TestAPIRequiresToken is the explicit auth contract for every /api/*
+// route: no token (or a wrong token) is 401; the correct token is 200.
+// Network reachability of localhost must not be enough to trigger these
+// shell-exec endpoints.
+func TestAPIRequiresToken(t *testing.T) {
+	repo := initRepo(t)
+	writeManifest(t, repo)
+	h := New(repo, "main", testToken)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/project", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: expected 401, got %d body=%s", rec.Code, rec.Body)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/project", nil)
+	req.Header.Set("X-Observer-Token", "wrong-token")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token: expected 401, got %d body=%s", rec.Code, rec.Body)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/project", nil)
+	req.Header.Set("X-Observer-Token", testToken)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("correct token: expected 200, got %d body=%s", rec.Code, rec.Body)
+	}
+}
+
 func TestIndexServesDashboardHTML(t *testing.T) {
 	repo := initRepo(t)
 	writeManifest(t, repo)
-	h := New(repo, "main")
+	h := New(repo, "main", testToken)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
@@ -127,12 +180,18 @@ func TestIndexServesDashboardHTML(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "Observer") {
 		t.Fatalf("expected dashboard HTML to contain a known marker, got: %s", rec.Body.String())
 	}
+	if !strings.Contains(rec.Body.String(), `content="`+testToken+`"`) {
+		t.Fatalf("expected meta tag to embed the real token, got: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "__OBSERVER_TOKEN__") {
+		t.Fatalf("literal __OBSERVER_TOKEN__ placeholder leaked into served HTML: %s", rec.Body.String())
+	}
 }
 
 func TestWebAssetServesJS(t *testing.T) {
 	repo := initRepo(t)
 	writeManifest(t, repo)
-	h := New(repo, "main")
+	h := New(repo, "main", testToken)
 
 	req := httptest.NewRequest(http.MethodGet, "/web/app.js", nil)
 	rec := httptest.NewRecorder()
@@ -151,7 +210,7 @@ func TestWebAssetServesJS(t *testing.T) {
 func TestWebAssetUnknownPath404s(t *testing.T) {
 	repo := initRepo(t)
 	writeManifest(t, repo)
-	h := New(repo, "main")
+	h := New(repo, "main", testToken)
 
 	req := httptest.NewRequest(http.MethodGet, "/web/does-not-exist.js", nil)
 	rec := httptest.NewRecorder()
