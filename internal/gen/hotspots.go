@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/taikuri-infra/observer/internal/gitmeta"
 )
 
 // FileStat is one file's churn in Hotspots' report: how many distinct
@@ -30,8 +32,9 @@ func Hotspots(repoDir, sinceRef string, top int) ([]FileStat, error) {
 	if sinceRef != "" {
 		args = append(args, sinceRef+"..HEAD")
 	}
-	cmd := exec.Command("git", args...)
-	cmd.Dir = repoDir
+	// gitmeta.Command hardens the invocation against malicious repo-local
+	// config/hooks — Hotspots may run against an untrusted mounted repo.
+	cmd := gitmeta.Command(repoDir, args...)
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {

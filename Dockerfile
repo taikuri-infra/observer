@@ -64,7 +64,9 @@ RUN npm i -g dependency-cruiser
 
 # R5: a repo mounted at /work is owned by the host UID (not root, not this
 # image's build-time UID); `git` refuses "dubious ownership" otherwise.
-RUN git config --system --add safe.directory '*'
+# Scoped to the mount point only (not '*') — a wildcard would also mark any
+# other untrusted repo path reachable inside the container as safe.
+RUN git config --system --add safe.directory /work
 
 COPY --from=builder /out/observer /usr/local/bin/observer
 

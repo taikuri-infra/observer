@@ -3,6 +3,7 @@
 package gitmeta
 
 import (
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -15,10 +16,38 @@ type Meta struct {
 	Dirty     bool
 }
 
-func git(dir string, args ...string) (string, error) {
-	c := exec.Command("git", args...)
+// Command builds a hardened *exec.Cmd for running git against dir. Observer
+// may analyze untrusted, mounted repos, and a plain `git` invocation trusts
+// that repo's local config and hooks — a malicious core.hooksPath,
+// core.fsmonitor, core.sshCommand, core.pager, or alias can execute
+// arbitrary code on an otherwise read-only command (CVE-2022-24765 class).
+//
+// Every git exec in this codebase must go through Command, never
+// exec.Command("git", ...) directly: it prefixes every invocation with
+// -c flags that disable hooks/fsmonitor/the ext protocol, and sets the
+// process env so neither a global nor system gitconfig (which, combined
+// with a malicious repo-local include, could still inject settings) nor an
+// interactive credential prompt can apply.
+func Command(dir string, args ...string) *exec.Cmd {
+	hardened := make([]string, 0, len(args)+6)
+	hardened = append(hardened,
+		"-c", "core.hooksPath=/dev/null",
+		"-c", "core.fsmonitor=false",
+		"-c", "protocol.ext.allow=never",
+	)
+	hardened = append(hardened, args...)
+	c := exec.Command("git", hardened...)
 	c.Dir = dir
-	out, err := c.Output()
+	c.Env = append(os.Environ(),
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_TERMINAL_PROMPT=0",
+	)
+	return c
+}
+
+func git(dir string, args ...string) (string, error) {
+	out, err := Command(dir, args...).Output()
 	return strings.TrimSpace(string(out)), err
 }
 

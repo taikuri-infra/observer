@@ -5,7 +5,6 @@ package gen
 
 import (
 	"fmt"
-	"os/exec"
 	"strconv"
 	"strings"
 
@@ -62,10 +61,11 @@ func dirtyLabel(dirty bool) string {
 	return "clean"
 }
 
+// gitOutput runs git through gitmeta.Command (hardened against malicious
+// repo-local config/hooks — the repos this generator inspects may be
+// untrusted).
 func gitOutput(dir string, args ...string) (string, error) {
-	c := exec.Command("git", args...)
-	c.Dir = dir
-	out, err := c.Output()
+	out, err := gitmeta.Command(dir, args...).Output()
 	return strings.TrimSpace(string(out)), err
 }
 
