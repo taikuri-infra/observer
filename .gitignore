@@ -1,0 +1,14 @@
+# Build artifacts
+/dist/
+/observer
+*.out
+
+# Go
+/vendor/
+
+# Node (bundled tools build, if any)
+node_modules/
+
+# Local scratch
+*.log
+.DS_Store
