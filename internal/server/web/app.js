@@ -25,7 +25,7 @@
   };
 
   if (window.mermaid) {
-    window.mermaid.initialize({ startOnLoad: false, theme: "dark" });
+    window.mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "strict" });
   }
 
   els.updateBtn.addEventListener("click", onUpdateClick);
@@ -227,18 +227,31 @@
     }
   }
 
+  // Artifacts are derived from repo content (commit messages, file/table names,
+  // identifiers) and Observer may analyze untrusted repos, so all rendered HTML
+  // is sanitized with DOMPurify before innerHTML assignment (defense in depth —
+  // the dashboard is same-origin with an API that runs shell commands).
+  function safeHTML(html) {
+    return window.DOMPurify ? window.DOMPurify.sanitize(html) : escapeHtml(html);
+  }
+  function safeSVG(svg) {
+    return window.DOMPurify
+      ? window.DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true } })
+      : "";
+  }
+
   function renderMarkdown(text) {
     var html = window.marked ? window.marked.parse(text) : escapeHtml(text);
     var div = document.createElement("div");
     div.className = "render-markdown";
-    div.innerHTML = html;
+    div.innerHTML = safeHTML(html);
     setContent(div);
   }
 
   function renderSVG(text) {
     var div = document.createElement("div");
     div.className = "render-svg";
-    div.innerHTML = text;
+    div.innerHTML = safeSVG(text);
     setContent(div);
   }
 
@@ -255,7 +268,7 @@
     window.mermaid
       .render(id, text)
       .then(function (result) {
-        div.innerHTML = result.svg;
+        div.innerHTML = safeSVG(result.svg);
       })
       .catch(function (err) {
         div.innerHTML =
@@ -276,8 +289,7 @@
     getViz()
       .then(function (viz) {
         var svgEl = viz.renderSVGElement(text);
-        div.innerHTML = "";
-        div.appendChild(svgEl);
+        div.innerHTML = safeSVG(svgEl.outerHTML);
       })
       .catch(function (err) {
         div.innerHTML =
