@@ -54,6 +54,7 @@ func usage() {
 Usage:
   observer serve [--repo .] [--base main] [--addr 127.0.0.1] [--port 7979]
   observer gen changes --base main --out <path> [--repo .]
+  observer gen er --migrations <dir> --out <er.mmd> --dbml-out <er.dbml> [--repo .]
   observer init [--repo .]
   observer doctor
   observer version
@@ -93,8 +94,10 @@ func runGen(args []string) error {
 	switch args[0] {
 	case "changes":
 		return runGenChanges(args[1:])
+	case "er":
+		return runGenER(args[1:])
 	default:
-		return fmt.Errorf("gen: unknown generator %q (available: changes)", args[0])
+		return fmt.Errorf("gen: unknown generator %q (available: changes, er)", args[0])
 	}
 }
 
@@ -118,6 +121,41 @@ func runGenChanges(args []string) error {
 		return fmt.Errorf("gen changes: %w", err)
 	}
 	return writeOut(absRepo, *out, md)
+}
+
+// runGenER is R2/R10: gen er takes --migrations plus two --out flags and
+// writes both files itself (mermaid erDiagram + DBML snapshot).
+func runGenER(args []string) error {
+	fs := flag.NewFlagSet("gen er", flag.ExitOnError)
+	repo := fs.String("repo", ".", "path to the repo")
+	migrations := fs.String("migrations", "", "path to the SQL migrations directory (required)")
+	out := fs.String("out", "", "mermaid output file path (required)")
+	dbmlOut := fs.String("dbml-out", "", "DBML output file path (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *migrations == "" {
+		return fmt.Errorf("gen er: --migrations is required")
+	}
+	if *out == "" || *dbmlOut == "" {
+		return fmt.Errorf("gen er: --out and --dbml-out are required")
+	}
+	absRepo, err := absPath(*repo)
+	if err != nil {
+		return err
+	}
+	absMigrations := *migrations
+	if !filepath.IsAbs(absMigrations) {
+		absMigrations = filepath.Join(absRepo, absMigrations)
+	}
+	mermaid, dbml, err := gen.ER(absMigrations)
+	if err != nil {
+		return fmt.Errorf("gen er: %w", err)
+	}
+	if err := writeOut(absRepo, *out, mermaid); err != nil {
+		return err
+	}
+	return writeOut(absRepo, *dbmlOut, dbml)
 }
 
 func writeOut(repo, out, content string) error {
