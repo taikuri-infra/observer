@@ -9,6 +9,16 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o /out/observer ./cmd/observer
 
+# ── Tool builder ─────────────────────────────────────────────────────
+# Builds go-callvis from the committed tools/go.sum so its checksum (and all
+# its transitive deps) is enforced from OUR pinned sum file — immune to a
+# re-registered / repo-jacked upstream namespace serving a different artifact.
+FROM golang:1.26 AS toolbuilder
+WORKDIR /tools
+COPY tools/go.mod tools/go.sum ./
+RUN go mod download
+RUN go build -o /out/go-callvis github.com/ofabry/go-callvis
+
 # ── Runtime ──────────────────────────────────────────────────────────
 # Slim Debian base, polyglot: bundles every analyzer tab's external tool so
 # the host needs only Docker (plan M4). The Go toolchain is kept at runtime
@@ -52,12 +62,12 @@ ENV GOPATH=/go \
     GOMODCACHE=/go/pkg/mod \
     HOME=/tmp
 
-# R13: pin go-callvis to a tagged release, never @latest, so the image is
-# reproducible. NOTE: github.com/ondrajz/go-callvis was renamed on GitHub;
-# `git clone` still redirects, but `go install` validates the module's
-# declared path in go.mod, which is github.com/ofabry/go-callvis — use that.
-RUN go install github.com/ofabry/go-callvis@v0.7.1 \
-    && cp /go/bin/go-callvis /usr/local/bin/go-callvis
+# go-callvis: built from the pinned tools/ module (see toolbuilder stage) and
+# copied in as a binary — integrity enforced by our committed tools/go.sum,
+# not by trusting the upstream namespace at install time. (ofabry is the
+# canonical module path; ondrajz is the old owner handle and fails the
+# module-path check.) Pinned to v0.7.1 (R13 — never @latest).
+COPY --from=toolbuilder /out/go-callvis /usr/local/bin/go-callvis
 
 # R9: dependency-cruiser for the Frontend deps tab.
 RUN npm i -g dependency-cruiser
