@@ -53,8 +53,10 @@ ENV GOPATH=/go \
     HOME=/tmp
 
 # R13: pin go-callvis to a tagged release, never @latest, so the image is
-# reproducible.
-RUN go install github.com/ondrajz/go-callvis@v0.7.1 \
+# reproducible. NOTE: github.com/ondrajz/go-callvis was renamed on GitHub;
+# `git clone` still redirects, but `go install` validates the module's
+# declared path in go.mod, which is github.com/ofabry/go-callvis — use that.
+RUN go install github.com/ofabry/go-callvis@v0.7.1 \
     && cp /go/bin/go-callvis /usr/local/bin/go-callvis
 
 # R9: dependency-cruiser for the Frontend deps tab.
