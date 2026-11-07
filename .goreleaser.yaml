@@ -1,0 +1,91 @@
+version: 2
+
+project_name: observer
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: observer
+    main: ./cmd/observer
+    binary: observer
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: observer
+    ids:
+      - observer
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - scripts/observer
+      - scripts/install.sh
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ .Tag }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+dockers:
+  - id: observer-amd64
+    ids:
+      - observer
+    goos: linux
+    goarch: amd64
+    dockerfile: Dockerfile
+    image_templates:
+      - "ghcr.io/taikuri-infra/observer:{{ .Version }}-amd64"
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source=https://github.com/taikuri-infra/observer"
+  - id: observer-arm64
+    ids:
+      - observer
+    goos: linux
+    goarch: arm64
+    dockerfile: Dockerfile
+    image_templates:
+      - "ghcr.io/taikuri-infra/observer:{{ .Version }}-arm64"
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source=https://github.com/taikuri-infra/observer"
+
+docker_manifests:
+  - name_template: "ghcr.io/taikuri-infra/observer:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/taikuri-infra/observer:{{ .Version }}-amd64"
+      - "ghcr.io/taikuri-infra/observer:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/taikuri-infra/observer:latest"
+    image_templates:
+      - "ghcr.io/taikuri-infra/observer:{{ .Version }}-amd64"
+      - "ghcr.io/taikuri-infra/observer:{{ .Version }}-arm64"
+
+release:
+  github:
+    owner: taikuri-infra
+    name: observer
