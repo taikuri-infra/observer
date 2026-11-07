@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -62,7 +63,41 @@ func New(repo, base, token string) http.Handler {
 	mux.HandleFunc("/api/artifact", s.requireToken(s.handleArtifact))
 	mux.HandleFunc("/web/", s.handleWebAsset)
 	mux.HandleFunc("/", s.handleIndex)
-	return mux
+	// Wrap every route with a Host allowlist so a DNS-rebinding page (an
+	// attacker domain resolving to 127.0.0.1) cannot reach the shell-exec API.
+	return allowedHost(mux)
+}
+
+// allowedHost rejects requests whose Host header is not a loopback name,
+// defeating DNS-rebinding attacks against the local server.
+func allowedHost(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		switch host {
+		case "localhost", "127.0.0.1", "::1", "[::1]":
+			next.ServeHTTP(w, r)
+		default:
+			http.Error(w, "forbidden host", http.StatusForbidden)
+		}
+	})
+}
+
+// tokenValid reports whether the request carries the session token, either as
+// the HttpOnly observer_token cookie (browser, set on the authenticated index
+// load) or the X-Observer-Token header (programmatic clients). Constant-time
+// compared so the check can't leak the token via timing.
+func (s *Server) tokenValid(r *http.Request) bool {
+	if s.token == "" {
+		return false
+	}
+	if c, err := r.Cookie("observer_token"); err == nil &&
+		subtle.ConstantTimeCompare([]byte(c.Value), []byte(s.token)) == 1 {
+		return true
+	}
+	return subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Observer-Token")), []byte(s.token)) == 1
 }
 
 // requireToken wraps an /api/* handler so it 401s unless the request carries
@@ -72,9 +107,8 @@ func New(repo, base, token string) http.Handler {
 // empty header never matches.
 func (s *Server) requireToken(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		got := r.Header.Get("X-Observer-Token")
-		if s.token == "" || subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) != 1 {
-			http.Error(w, "missing or invalid X-Observer-Token", http.StatusUnauthorized)
+		if !s.tokenValid(r) {
+			http.Error(w, "missing or invalid observer token", http.StatusUnauthorized)
 			return
 		}
 		next(w, r)
@@ -91,15 +125,34 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// Require the token before disclosing the dashboard — otherwise an
+	// unauthenticated GET / would hand out everything needed to drive the
+	// shell-exec API. Accept it from the ?token= link `observer serve` prints,
+	// or the cookie set on a prior authenticated load.
+	q := r.URL.Query().Get("token")
+	authed := s.tokenValid(r) ||
+		(s.token != "" && subtle.ConstantTimeCompare([]byte(q), []byte(s.token)) == 1)
+	if !authed {
+		http.Error(w, "unauthorized — open the /?token=<token> URL printed by `observer serve`", http.StatusUnauthorized)
+		return
+	}
+	// Set an HttpOnly, SameSite=Strict session cookie so subsequent page and
+	// /api/* requests authenticate without the token in the URL or the DOM.
+	http.SetCookie(w, &http.Cookie{
+		Name:     "observer_token",
+		Value:    s.token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
 	data, err := webFS.ReadFile("web/index.html")
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	html := strings.ReplaceAll(string(data), "__OBSERVER_TOKEN__", s.token)
 	w.Header().Set("Content-Type", webContentType("index.html"))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(html))
+	_, _ = w.Write(data)
 }
 
 // handleWebAsset serves everything under the embedded web/ tree (app.js,

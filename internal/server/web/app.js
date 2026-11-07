@@ -17,14 +17,10 @@
 
   var mermaidCounter = 0;
 
-  // The server embeds a per-session token (OBSERVER_TOKEN) into the page via
-  // a meta tag; every /api/* request must carry it as X-Observer-Token or
-  // the server returns 401 (the API endpoints run shell commands).
-  var apiToken = (function () {
-    var meta = document.querySelector('meta[name="observer-token"]');
-    return meta ? meta.getAttribute("content") : "";
-  })();
-
+  // Auth: the server set an HttpOnly, SameSite=Strict `observer_token` cookie
+  // on the authenticated index load (reached via the /?token=... URL that
+  // `observer serve` prints). The browser sends that cookie automatically on
+  // every same-origin /api/* request, so no token handling is needed here.
   var els = {
     tabs: document.getElementById("tabs"),
     projectName: document.getElementById("project-name"),
@@ -45,7 +41,7 @@
   // ---- Data loading ----
 
   function loadProject() {
-    fetch("/api/project", { headers: { "X-Observer-Token": apiToken } })
+    fetch("/api/project")
       .then(function (r) {
         if (!r.ok) throw new Error("GET /api/project: " + r.status);
         return r.json();
@@ -151,9 +147,7 @@
 
   function loadArtifact(tab) {
     els.content.innerHTML = '<p class="empty">Loading&hellip;</p>';
-    fetch("/api/artifact?tab=" + encodeURIComponent(tab.name), {
-      headers: { "X-Observer-Token": apiToken },
-    })
+    fetch("/api/artifact?tab=" + encodeURIComponent(tab.name))
       .then(function (r) {
         if (r.status === 404) {
           els.content.innerHTML =
@@ -185,7 +179,7 @@
 
     fetch("/api/update?tab=" + encodeURIComponent(tab.name), {
       method: "POST",
-      headers: { "X-Observer": "1", "X-Observer-Token": apiToken },
+      headers: { "X-Observer": "1" },
     })
       .then(function (r) {
         return r.json().then(function (artifact) {
