@@ -211,11 +211,29 @@ func goCallGraphTabs(repo string, goModules []string) ([]manifest.Tab, error) {
 		}
 	}
 
+	// When more than one module contributes mains, disambiguate the tab
+	// NAME and OUTPUT by the main's FULL repo-relative path (module + main
+	// dir), not just its module-relative dir: two modules can each have a
+	// "cmd/server" main (services/api/cmd/server + services/worker/cmd/
+	// server), which — keyed on "cmd/server" alone — would collide to one
+	// output file (last write wins) AND one duplicate tab name (breaking
+	// /api/artifact?tab= lookup). Within a single module, main dirs are
+	// already unique, so the shorter module-relative dir is kept.
+	modSet := map[string]bool{}
+	for _, m := range mains {
+		modSet[m.mod] = true
+	}
+	multiModule := len(modSet) > 1
+
 	var tabs []manifest.Tab
 	for _, m := range mains {
-		out := outputName("callgraph-map.json", m.dir, len(mains))
+		key := m.dir
+		if multiModule {
+			key = filepath.ToSlash(filepath.Join(m.mod, m.dir))
+		}
+		out := outputName("callgraph-map.json", key, len(mains))
 		tabs = append(tabs, manifest.Tab{
-			Name: tabName("Call graph", m.dir, len(mains)),
+			Name: tabName("Call graph", key, len(mains)),
 			Kind: manifest.KindGenerator,
 			Command: fmt.Sprintf(
 				"observer gen callgraphmodel --dir '%s' --main '%s' --out 'obs-data/%s'",

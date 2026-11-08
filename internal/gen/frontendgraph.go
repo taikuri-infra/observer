@@ -3,6 +3,7 @@ package gen
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -179,14 +180,70 @@ func ParseFrontendGraph(depcruiseJSON []byte, relModuleDir string) (*Graph, erro
 // relModuleDir is moduleDir's repo-relative path, used the same way
 // GraphModel uses its module's — see ParseFrontendGraph.
 func FrontendGraphModel(moduleDir, relModuleDir, src string) (*Graph, error) {
-	cmd := exec.Command("depcruise", "--no-config", "--exclude", "node_modules", "--output-type", "json", src)
+	args := depcruiseArgs(moduleDir, src)
+	out, err := runDepcruise(moduleDir, args)
+	if err != nil {
+		// The --ts-config run can fail when the depcruise on PATH bundles a
+		// TypeScript too old for a modern tsconfig (e.g. "moduleResolution":
+		// "bundler" -> TS6046) — common when depcruise is installed globally
+		// rather than as the project devDependency it recommends. Rather
+		// than a permanently-red tab, retry WITHOUT --ts-config: TS path
+		// aliases (@/components/...) then go unresolved so some intra-app
+		// edges are lost, but the graph still builds. Only retry if we
+		// actually passed --ts-config (else there's nothing to drop).
+		if plain := stripTSConfig(args); len(plain) < len(args) {
+			if out2, err2 := runDepcruise(moduleDir, plain); err2 == nil {
+				return ParseFrontendGraph(out2, relModuleDir)
+			}
+		}
+		return nil, err
+	}
+	return ParseFrontendGraph(out, relModuleDir)
+}
+
+// runDepcruise executes depcruise with args in moduleDir and returns its
+// stdout, wrapping a non-zero exit with its stderr for diagnosis.
+func runDepcruise(moduleDir string, args []string) ([]byte, error) {
+	cmd := exec.Command("depcruise", args...)
 	cmd.Dir = moduleDir
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("depcruise --output-type json %s in %s: %w\n%s", src, moduleDir, err, ee.Stderr)
+			return nil, fmt.Errorf("depcruise %v in %s: %w\n%s", args, moduleDir, err, ee.Stderr)
 		}
-		return nil, fmt.Errorf("depcruise --output-type json %s in %s: %w", src, moduleDir, err)
+		return nil, fmt.Errorf("depcruise %v in %s: %w", args, moduleDir, err)
 	}
-	return ParseFrontendGraph(out, relModuleDir)
+	return out, nil
+}
+
+// stripTSConfig returns args with any `--ts-config <value>` pair removed —
+// the fallback path for FrontendGraphModel when the --ts-config run fails.
+func stripTSConfig(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--ts-config" {
+			i++ // skip the flag AND its value
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return out
+}
+
+// depcruiseArgs builds the dependency-cruiser argument vector for moduleDir.
+// When the module has a tsconfig.json, `--ts-config tsconfig.json` is added:
+// without it, `--no-config` depcruise can't resolve TypeScript path aliases
+// (the `@/components/...` style a Next.js app uses), so nearly every
+// intra-app import silently resolves to nothing and the edge is dropped —
+// the graph keeps its nodes but loses most of its edges. node_modules stays
+// excluded either way (depcruise otherwise walks into every npm package it
+// touches). Factored out as a pure helper so the arg construction is unit-
+// testable without depcruise installed.
+func depcruiseArgs(moduleDir, src string) []string {
+	args := []string{"--no-config", "--exclude", "node_modules"}
+	if _, err := os.Stat(filepath.Join(moduleDir, "tsconfig.json")); err == nil {
+		args = append(args, "--ts-config", "tsconfig.json")
+	}
+	args = append(args, "--output-type", "json", src)
+	return args
 }

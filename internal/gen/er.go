@@ -32,9 +32,20 @@ type erRel struct {
 }
 
 var (
-	createTableRe = regexp.MustCompile(`(?is)CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*?)\n\);`)
+	// createTableRe tolerates an optional schema prefix on the table name
+	// (`public.users` -> captures "users", schema stripped) and a closing
+	// line that isn't exactly "\n);": indentation before the ")", and
+	// trailing table options after it (`) STRICT;`, `) PARTITION BY RANGE
+	// (created_at);`) are all accepted — the terminator is "a line whose
+	// first non-blank char is ')', up to the ';'".
+	createTableRe = regexp.MustCompile(`(?is)CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*?)\n[ \t]*\)[^;\n]*;`)
 	columnRe      = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\s+([A-Za-z0-9_]+)`)
-	referencesRe  = regexp.MustCompile(`(?i)REFERENCES\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\))?`)
+	// referencesRe strips an optional schema prefix on the referenced table
+	// (`REFERENCES public.users(id)` -> parent "users", not "public").
+	referencesRe = regexp.MustCompile(`(?i)REFERENCES\s+(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\))?`)
+	// fkColRe pulls the (first) child column out of a table-level
+	// `FOREIGN KEY (a, b) REFERENCES ...` constraint line.
+	fkColRe = regexp.MustCompile(`(?i)FOREIGN\s+KEY\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)`)
 )
 
 // ER parses CREATE TABLE statements out of the *.sql files in migrationsDir
@@ -111,6 +122,16 @@ func parseSQL(sql string) ([]erTable, []erRel) {
 				}
 			}
 			if excluded {
+				// A table-level constraint line is never a column — but a
+				// FOREIGN KEY (...) REFERENCES ... line still declares an
+				// edge, so scan it for the reference before skipping.
+				if rm := referencesRe.FindStringSubmatch(line); rm != nil {
+					childCol := "fk"
+					if cm := fkColRe.FindStringSubmatch(line); cm != nil {
+						childCol = strings.ToLower(cm[1])
+					}
+					rels = append(rels, newRel(rm, name, childCol))
+				}
 				continue
 			}
 			cm := columnRe.FindStringSubmatch(line)
@@ -123,21 +144,28 @@ func parseSQL(sql string) ([]erTable, []erRel) {
 			fk := strings.Contains(upper, "REFERENCES")
 			cols = append(cols, erColumn{name: col, typ: typ, pk: pk, fk: fk})
 			if rm := referencesRe.FindStringSubmatch(line); rm != nil {
-				parentCol := rm[2]
-				if parentCol == "" {
-					parentCol = "id"
-				}
-				rels = append(rels, erRel{
-					parent:    strings.ToLower(rm[1]),
-					parentCol: strings.ToLower(parentCol),
-					child:     name,
-					col:       col,
-				})
+				rels = append(rels, newRel(rm, name, col))
 			}
 		}
 		tables = append(tables, erTable{name: name, columns: cols})
 	}
 	return tables, rels
+}
+
+// newRel builds an erRel from a referencesRe match (rm[1]=parent table with
+// any schema already stripped, rm[2]=parent column or "") for child.childCol.
+// A missing parent column defaults to "id", the overwhelmingly common PK.
+func newRel(rm []string, child, childCol string) erRel {
+	parentCol := rm[2]
+	if parentCol == "" {
+		parentCol = "id"
+	}
+	return erRel{
+		parent:    strings.ToLower(rm[1]),
+		parentCol: strings.ToLower(parentCol),
+		child:     child,
+		col:       childCol,
+	}
 }
 
 // ERGraphModel parses the same CREATE TABLE statements as ER (reusing

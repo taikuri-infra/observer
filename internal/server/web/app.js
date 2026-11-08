@@ -371,9 +371,66 @@
     loc: "lines of code",
     callers: "callers (in-degree)",
     callees: "callees (out-degree)",
+    columns: "columns",
+    fkIn: "foreign keys in",
+    fkOut: "foreign keys out",
   };
   function mapMetricLabel(key) {
     return MAP_METRIC_LABEL[key] || key;
+  }
+
+  // Short labels for the metric cells (hover card + detail panel). Per-kind
+  // metrics are data-driven off these, not hardcoded to Dependents/Imports/
+  // Churn — so a "table" node shows Columns/FK in/FK out and a "func" node
+  // shows Callers/Callees, instead of three meaningless zeros.
+  var MAP_METRIC_CELL = {
+    dependents: "Dependents",
+    imports: "Imports",
+    churn: "Churn",
+    loc: "LOC",
+    columns: "Columns",
+    fkIn: "FK in",
+    fkOut: "FK out",
+    callers: "Callers",
+    callees: "Callees",
+  };
+  // Compact forms for the on-canvas node sublabel (space is tight there).
+  var MAP_METRIC_ABBR = {
+    dependents: "dep",
+    imports: "imp",
+    churn: "churn",
+    loc: "loc",
+    columns: "cols",
+    fkIn: "fk←",
+    fkOut: "fk→",
+    callers: "in",
+    callees: "out",
+  };
+  // The order metrics are considered in for display (most salient first).
+  var MAP_METRIC_ORDER = [
+    "dependents",
+    "imports",
+    "callers",
+    "callees",
+    "columns",
+    "fkIn",
+    "fkOut",
+    "churn",
+    "loc",
+  ];
+  // nodeMetricEntries returns a node's non-zero metrics as [key, value]
+  // pairs in MAP_METRIC_ORDER — the shared basis for the sublabel, hover
+  // card, and panel so each node kind shows only the metrics it actually
+  // carries.
+  function nodeMetricEntries(n) {
+    var m = n.metrics || {};
+    var out = [];
+    MAP_METRIC_ORDER.forEach(function (k) {
+      if (typeof m[k] === "number" && m[k] !== 0 && MAP_METRIC_CELL[k]) {
+        out.push([k, m[k]]);
+      }
+    });
+    return out;
   }
 
   function svgEl(tag, attrs) {
@@ -837,7 +894,15 @@
         grp.appendChild(lb);
 
         var sb = svgEl("text", { class: "sub", x: pos.x + r + 6, y: pos.y + 8, "text-anchor": "start" });
-        sb.textContent = "◂" + ((n.metrics && n.metrics.dependents) || 0) + " ▸" + ((n.metrics && n.metrics.imports) || 0);
+        // First two non-zero metrics for THIS node's kind (e.g. "cols 8 ·
+        // fk← 1" for a table, "in 3 · out 2" for a func), not a hardcoded
+        // dependents/imports pair that reads "dep 0 · imp 0" on either.
+        sb.textContent = nodeMetricEntries(n)
+          .slice(0, 2)
+          .map(function (e) {
+            return MAP_METRIC_ABBR[e[0]] + " " + e[1];
+          })
+          .join(" · ");
         grp.appendChild(sb);
 
         gNodes.appendChild(grp);
@@ -977,22 +1042,35 @@
 
       var metrics = document.createElement("div");
       metrics.className = "metrics";
-      [
-        ["Dependents", (n.metrics && n.metrics.dependents) || 0],
-        ["Imports", (n.metrics && n.metrics.imports) || 0],
-        ["Churn", (n.metrics && n.metrics.churn) || 0],
-      ].forEach(function (pair) {
-        var cell = document.createElement("div");
-        var k = document.createElement("div");
-        k.className = "k";
-        k.textContent = pair[0];
-        var v = document.createElement("div");
-        v.className = "v";
-        v.textContent = String(pair[1]);
-        cell.appendChild(k);
-        cell.appendChild(v);
-        metrics.appendChild(cell);
-      });
+      // Up to three non-zero metrics for this node's kind (the card's grid
+      // is three columns wide). A node with no non-zero metric gets a single
+      // muted placeholder rather than three zeros.
+      var cardEntries = nodeMetricEntries(n).slice(0, 3);
+      if (cardEntries.length === 0) {
+        var emptyCell = document.createElement("div");
+        var ek = document.createElement("div");
+        ek.className = "k";
+        ek.textContent = "Metrics";
+        var ev = document.createElement("div");
+        ev.className = "v";
+        ev.textContent = "—";
+        emptyCell.appendChild(ek);
+        emptyCell.appendChild(ev);
+        metrics.appendChild(emptyCell);
+      } else {
+        cardEntries.forEach(function (pair) {
+          var cell = document.createElement("div");
+          var k = document.createElement("div");
+          k.className = "k";
+          k.textContent = MAP_METRIC_CELL[pair[0]] || pair[0];
+          var v = document.createElement("div");
+          v.className = "v";
+          v.textContent = String(pair[1]);
+          cell.appendChild(k);
+          cell.appendChild(v);
+          metrics.appendChild(cell);
+        });
+      }
 
       var foot = document.createElement("div");
       foot.className = "foot";
@@ -1138,10 +1216,17 @@
       metH.textContent = "Metrics";
       var mrow = document.createElement("div");
       mrow.className = "map-mrow";
-      var m = n.metrics || {};
-      mrow.appendChild(metricCell("Dependents", m.dependents || 0));
-      mrow.appendChild(metricCell("Imports", m.imports || 0));
-      mrow.appendChild(metricCell("Churn", m.churn || 0));
+      // Every non-zero metric this node's kind carries — go-deps shows
+      // Dependents/Imports/Churn, a table shows Columns/FK in/FK out, a
+      // func shows Callers/Callees — instead of a hardcoded three.
+      var panelEntries = nodeMetricEntries(n);
+      if (panelEntries.length === 0) {
+        mrow.appendChild(metricCell("Metrics", "—"));
+      } else {
+        panelEntries.forEach(function (e) {
+          mrow.appendChild(metricCell(MAP_METRIC_CELL[e[0]] || e[0], e[1]));
+        });
+      }
       metSec.appendChild(metH);
       metSec.appendChild(mrow);
       pb.appendChild(metSec);

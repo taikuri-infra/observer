@@ -139,6 +139,107 @@ func TestERGraphModel(t *testing.T) {
 	}
 }
 
+// TestERTableLevelFK covers a table-level (here composite) FOREIGN KEY
+// constraint line — `FOREIGN KEY (a, b) REFERENCES parent (a, b)` — which the
+// excludedLinePrefixes filter would drop before the REFERENCES scan if the
+// scan didn't also run on excluded constraint lines. The edge must still
+// appear, keyed on the first FK column.
+func TestERTableLevelFK(t *testing.T) {
+	const sql = `CREATE TABLE parent (
+    a INTEGER NOT NULL,
+    b INTEGER NOT NULL,
+    PRIMARY KEY (a, b)
+);
+
+CREATE TABLE child (
+    id UUID PRIMARY KEY,
+    a INTEGER NOT NULL,
+    b INTEGER NOT NULL,
+    FOREIGN KEY (a, b) REFERENCES parent (a, b)
+);
+`
+	tables, rels := parseSQL(sql)
+	if len(tables) != 2 {
+		t.Fatalf("tables = %+v, want 2", tables)
+	}
+	if len(rels) != 1 {
+		t.Fatalf("rels = %+v, want 1 (the table-level composite FK)", rels)
+	}
+	r := rels[0]
+	if r.parent != "parent" || r.child != "child" {
+		t.Fatalf("rel = %+v, want child->parent", r)
+	}
+	if r.col != "a" {
+		t.Fatalf("rel.col = %q, want a (first FK column)", r.col)
+	}
+}
+
+// TestERSchemaQualified covers schema-qualified names: `CREATE TABLE
+// public.users (...)` must still produce a "users" table (not be dropped),
+// and `REFERENCES public.users(id)` must resolve the parent to "users" (not
+// a phantom "public" node).
+func TestERSchemaQualified(t *testing.T) {
+	const sql = `CREATE TABLE public.users (
+    id UUID PRIMARY KEY,
+    email TEXT NOT NULL
+);
+
+CREATE TABLE public.sessions (
+    id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES public.users(id)
+);
+`
+	tables, rels := parseSQL(sql)
+	names := map[string]bool{}
+	for _, tbl := range tables {
+		names[tbl.name] = true
+	}
+	if !names["users"] || !names["sessions"] {
+		t.Fatalf("tables = %+v, want users+sessions (schema stripped)", tables)
+	}
+	if names["public"] {
+		t.Fatalf("a phantom 'public' table was created: %+v", tables)
+	}
+	if len(rels) != 1 {
+		t.Fatalf("rels = %+v, want 1", rels)
+	}
+	if rels[0].parent != "users" {
+		t.Fatalf("rel.parent = %q, want users (schema stripped, not 'public')", rels[0].parent)
+	}
+	if rels[0].child != "sessions" {
+		t.Fatalf("rel.child = %q, want sessions", rels[0].child)
+	}
+}
+
+// TestERLooseTerminator covers CREATE TABLE closings other than exactly
+// "\n);": an indented ")", trailing table options (`) STRICT;`), and a
+// PARTITION BY clause after the paren.
+func TestERLooseTerminator(t *testing.T) {
+	const sql = `CREATE TABLE a (
+    id INTEGER PRIMARY KEY
+  );
+
+CREATE TABLE b (
+    id INTEGER PRIMARY KEY
+) STRICT;
+
+CREATE TABLE c (
+    id INTEGER PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL
+) PARTITION BY RANGE (created_at);
+`
+	tables, _ := parseSQL(sql)
+	got := map[string]bool{}
+	for _, tbl := range tables {
+		got[tbl.name] = true
+	}
+	for _, want := range []string{"a", "b", "c"} {
+		if !got[want] {
+			t.Fatalf("table %q missing (loose terminator not matched): %+v", want, tables)
+		}
+	}
+}
+
 func TestERSkipsDownMigrations(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "001_x_down.sql"), []byte("CREATE TABLE should_not_appear (\n    id UUID PRIMARY KEY\n);\n"), 0o644); err != nil {

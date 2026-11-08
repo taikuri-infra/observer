@@ -239,6 +239,52 @@ func TestDefaultTabsServicePlus(t *testing.T) {
 	}
 }
 
+// TestGoCallGraphTabsMultiModuleNoCollision guards the call-graph
+// disambiguation fix: two Go modules that each have a `cmd/server` main
+// must NOT collapse to one duplicate tab name (which breaks
+// /api/artifact?tab= lookup) or one shared output file (last-write-wins).
+// Both must be unique, keyed on the main's full repo-relative path.
+func TestGoCallGraphTabsMultiModuleNoCollision(t *testing.T) {
+	repo := t.TempDir()
+	write := func(rel, content string) {
+		path := filepath.Join(repo, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("services/api/go.mod", "module example.com/api\n\ngo 1.22\n")
+	write("services/api/cmd/server/main.go", "package main\n\nfunc main() {}\n")
+	write("services/worker/go.mod", "module example.com/worker\n\ngo 1.22\n")
+	write("services/worker/cmd/server/main.go", "package main\n\nfunc main() {}\n")
+
+	tabs, err := goCallGraphTabs(repo, []string{"services/api", "services/worker"})
+	if err != nil {
+		t.Fatalf("goCallGraphTabs: %v", err)
+	}
+	if len(tabs) != 2 {
+		t.Fatalf("expected 2 call-graph tabs, got %d: %+v", len(tabs), tabs)
+	}
+	names := map[string]bool{}
+	outputs := map[string]bool{}
+	for _, tb := range tabs {
+		if names[tb.Name] {
+			t.Fatalf("duplicate call-graph tab name %q: %+v", tb.Name, tabs)
+		}
+		if outputs[tb.Output] {
+			t.Fatalf("duplicate call-graph output %q: %+v", tb.Output, tabs)
+		}
+		names[tb.Name] = true
+		outputs[tb.Output] = true
+	}
+	// The display name must carry the module so the two are tellable apart.
+	if !names["Call graph (services/api/cmd/server)"] || !names["Call graph (services/worker/cmd/server)"] {
+		t.Fatalf("tab names should include the full main path: %v", names)
+	}
+}
+
 func TestFilterSafeRelRejectsInjection(t *testing.T) {
 	in := []string{"services/api", "apps/web", "foo;rm -rf ~", "$(evil)", "a b", "../escape", "ok-1.2", "`x`"}
 	got := filterSafeRel(in)

@@ -4,6 +4,7 @@
 package plugins
 
 import (
+	"go/build"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -191,16 +192,28 @@ func findMainPackageDirs(moduleDir string) ([]string, error) {
 // the package clause rather than building a full AST. Unparsable files are
 // skipped rather than failing detection; a repo with one broken file
 // shouldn't hide every other main package.
+//
+// A file excluded from a normal build by a build constraint (most commonly
+// a `//go:build ignore` tool file, but also GOOS/GOARCH tags, etc.) is
+// skipped first: such a file isn't part of the buildable `package main`, so
+// targeting it would spawn a go-callvis run that fails every time and leaves
+// a permanently-red Call graph tab. build.Context.MatchFile evaluates the
+// file's build constraints (and name-based tags) under the default context,
+// so `//go:build ignore` -> no match -> skipped.
 func dirHasPackageMain(dir string) bool {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return false
 	}
+	ctxt := build.Default
 	fset := token.NewFileSet()
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
+		}
+		if match, mErr := ctxt.MatchFile(dir, name); mErr != nil || !match {
+			continue // unreadable, or excluded by a build constraint (e.g. //go:build ignore)
 		}
 		f, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.PackageClauseOnly)
 		if err != nil {

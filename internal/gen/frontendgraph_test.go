@@ -1,9 +1,54 @@
 package gen
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// TestDepcruiseArgsTSConfig: when the module has a tsconfig.json, the
+// depcruise args must include `--ts-config tsconfig.json` so path aliases
+// (@/components/...) resolve and intra-app edges aren't silently dropped;
+// node_modules stays excluded either way. Without a tsconfig, --ts-config
+// must be absent.
+func TestDepcruiseArgsTSConfig(t *testing.T) {
+	withTS := t.TempDir()
+	if err := os.WriteFile(filepath.Join(withTS, "tsconfig.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := depcruiseArgs(withTS, "src")
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--ts-config tsconfig.json") {
+		t.Fatalf("args = %v, want --ts-config tsconfig.json present", args)
+	}
+	if !strings.Contains(joined, "--exclude node_modules") {
+		t.Fatalf("args = %v, want --exclude node_modules present", args)
+	}
+	if args[len(args)-1] != "src" {
+		t.Fatalf("args = %v, want src as the final positional", args)
+	}
+
+	withoutTS := t.TempDir()
+	args2 := depcruiseArgs(withoutTS, "src")
+	if strings.Contains(strings.Join(args2, " "), "--ts-config") {
+		t.Fatalf("args = %v, want no --ts-config when tsconfig.json is absent", args2)
+	}
+
+	// stripTSConfig removes the flag AND its value, leaving an otherwise
+	// identical arg vector (the fallback when a --ts-config run fails).
+	stripped := stripTSConfig(args)
+	joinedStripped := strings.Join(stripped, " ")
+	if strings.Contains(joinedStripped, "--ts-config") || strings.Contains(joinedStripped, "tsconfig.json") {
+		t.Fatalf("stripTSConfig(%v) = %v, still has --ts-config/value", args, stripped)
+	}
+	if len(stripped) != len(args)-2 {
+		t.Fatalf("stripTSConfig dropped %d args, want exactly 2 (flag + value)", len(args)-len(stripped))
+	}
+	if !strings.Contains(joinedStripped, "--exclude node_modules") || stripped[len(stripped)-1] != "src" {
+		t.Fatalf("stripTSConfig mangled the rest of the args: %v", stripped)
+	}
+}
 
 // fixtureDepcruiseJSON is a minimal dependency-cruiser `--output-type json`
 // payload: src/pages/index.tsx (a route entry) imports src/components/Foo.tsx
