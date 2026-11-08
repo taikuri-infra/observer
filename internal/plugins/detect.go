@@ -4,6 +4,8 @@
 package plugins
 
 import (
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -127,6 +129,84 @@ func hasUpSQL(dir string) bool {
 		}
 		name := strings.ToLower(e.Name())
 		if strings.HasSuffix(name, ".sql") && !strings.Contains(name, "_down") {
+			return true
+		}
+	}
+	return false
+}
+
+// findMainPackageDirs walks moduleDir's whole subtree (skipping skipDirs,
+// hidden dirs, and any nested Go module — a directory containing its own
+// go.mod other than moduleDir itself, unbounded depth like
+// findMigrationsDirs since a repo's main packages can live anywhere, e.g.
+// one-off scripts/ CLI tools) and returns every directory — relative to
+// moduleDir, "/" separated, sorted — that directly contains at least one
+// non-test *.go file whose package clause is "package main".
+//
+// This exists so the Go call graph tab can target each main package
+// individually: go-callvis errors with "found multiple packages with
+// name: main" when given a pattern (e.g. "./...") that resolves to more
+// than one, which is exactly what servicePlus's services/api module hits
+// (cmd/server, cmd/retention-sweeper, and two scripts/ one-shot tools are
+// all "package main"). Finding each main up front and running go-callvis
+// once per main (see CallGraphModel) sidesteps that error rather than
+// working around it.
+func findMainPackageDirs(moduleDir string) ([]string, error) {
+	var found []string
+	err := filepath.WalkDir(moduleDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(moduleDir, path)
+		if relErr != nil {
+			return relErr
+		}
+		rel = filepath.ToSlash(rel)
+		if rel != "." && (skipDirs[d.Name()] || isHidden(d.Name())) {
+			return filepath.SkipDir
+		}
+		if rel != "." {
+			if _, statErr := os.Stat(filepath.Join(path, "go.mod")); statErr == nil {
+				return filepath.SkipDir // a nested module: not ours to scan
+			}
+		}
+		if dirHasPackageMain(path) {
+			found = append(found, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(found)
+	return found, nil
+}
+
+// dirHasPackageMain reports whether dir directly contains at least one
+// non-test *.go file whose package clause is "package main", parsed via
+// go/parser's PackageClauseOnly mode — cheap, since it stops right after
+// the package clause rather than building a full AST. Unparsable files are
+// skipped rather than failing detection; a repo with one broken file
+// shouldn't hide every other main package.
+func dirHasPackageMain(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	fset := token.NewFileSet()
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.PackageClauseOnly)
+		if err != nil {
+			continue
+		}
+		if f.Name != nil && f.Name.Name == "main" {
 			return true
 		}
 	}

@@ -62,6 +62,7 @@ func usage() {
 
 Usage:
   observer serve [--repo .] [--base main] [--addr 127.0.0.1] [--port 7979]
+  observer gen callgraphmodel --dir <moduleDir> --main <mainPkgDir> --out <graph.json> [--repo .]
   observer gen changes --base main --out <path> [--repo .]
   observer gen changedgraph --dir <moduleDir> --base main --out <graph.json> [--repo .]
   observer gen er --migrations <dir> --out <er.mmd> --dbml-out <er.dbml> [--json-out <graph.json>] [--repo .]
@@ -127,6 +128,8 @@ func runGen(args []string) error {
 		return fmt.Errorf("gen: missing generator name (changes)")
 	}
 	switch args[0] {
+	case "callgraphmodel":
+		return runGenCallGraphModel(args[1:])
 	case "changes":
 		return runGenChanges(args[1:])
 	case "changedgraph":
@@ -144,8 +147,51 @@ func runGen(args []string) error {
 	case "overview":
 		return runGenOverview(args[1:])
 	default:
-		return fmt.Errorf("gen: unknown generator %q (available: changes, changedgraph, er, frontendmodel, godeps, graphmodel, hotspots, overview)", args[0])
+		return fmt.Errorf("gen: unknown generator %q (available: callgraphmodel, changes, changedgraph, er, frontendmodel, godeps, graphmodel, hotspots, overview)", args[0])
 	}
+}
+
+// runGenCallGraphModel wires gen.CallGraphModel: --dir is the Go module
+// directory (relative to --repo unless absolute, same resolution as gen
+// graphmodel/godeps), --main is a single main package's directory relative
+// to --dir (e.g. "cmd/server") — exactly one, since go-callvis itself
+// errors on a pattern matching more than one "package main" ("found
+// multiple packages with name: main"). --out is where the normalized
+// graph.json is written. Unlike gen graphmodel, --repo doesn't matter
+// beyond resolving --dir: a function's location.path is relative to its Go
+// module, not the repo (see ParseCallGraphDOT).
+func runGenCallGraphModel(args []string) error {
+	fs := flag.NewFlagSet("gen callgraphmodel", flag.ExitOnError)
+	repo := fs.String("repo", ".", "path to the repo")
+	dir := fs.String("dir", ".", "path to the Go module directory (relative to --repo unless absolute)")
+	mainPkg := fs.String("main", "", "the main package's directory, relative to --dir (e.g. cmd/server) (required)")
+	out := fs.String("out", "", "output file path (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *mainPkg == "" {
+		return fmt.Errorf("gen callgraphmodel: --main is required")
+	}
+	if *out == "" {
+		return fmt.Errorf("gen callgraphmodel: --out is required")
+	}
+	absRepo, err := absPath(*repo)
+	if err != nil {
+		return err
+	}
+	absDir := *dir
+	if !filepath.IsAbs(absDir) {
+		absDir = filepath.Join(absRepo, absDir)
+	}
+	g, err := gen.CallGraphModel(absDir, *mainPkg)
+	if err != nil {
+		return fmt.Errorf("gen callgraphmodel: %w", err)
+	}
+	b, err := json.MarshalIndent(g, "", "  ")
+	if err != nil {
+		return fmt.Errorf("gen callgraphmodel: marshal: %w", err)
+	}
+	return writeOut(absRepo, *out, string(b))
 }
 
 func runGenChanges(args []string) error {

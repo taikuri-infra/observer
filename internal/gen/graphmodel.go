@@ -47,6 +47,14 @@ type GraphMetrics struct {
 	Columns int `json:"columns,omitempty"`
 	FKOut   int `json:"fkOut,omitempty"`
 	FKIn    int `json:"fkIn,omitempty"`
+	// Callers/Callees are only populated for "func" nodes (the Go call
+	// graph, see callgraphmodel.go's CallGraphModel): call-graph in-degree
+	// (how many functions call this one) and out-degree (how many
+	// functions this one calls) — omitempty keeps them out of every other
+	// graph.json's nodes. meta.sizeBy/colorBy reference these by name
+	// ("callers"), so the key must match the JSON tag exactly.
+	Callers int `json:"callers,omitempty"`
+	Callees int `json:"callees,omitempty"`
 }
 
 type GraphLocation struct {

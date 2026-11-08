@@ -37,6 +37,8 @@ func TestDefaultTabsFixture(t *testing.T) {
 		"CREATE TABLE x (\n    id UUID PRIMARY KEY\n);\n")
 	write("services/api/internal/adapters/postgres/tenant_migrations/001_x_down.sql",
 		"DROP TABLE x;\n")
+	write("services/api/cmd/server/main.go", "package main\n\nfunc main() {}\n")
+	write("services/api/cmd/worker/main.go", "package main\n\nfunc main() {}\n")
 	write("apps/web/package.json", `{"name":"web"}`)
 	write("apps/web/src/index.ts", "export const x = 1;\n")
 	write("tests/e2e/package.json", `{"name":"e2e"}`) // should be excluded (looks like test tooling)
@@ -80,15 +82,37 @@ func TestDefaultTabsFixture(t *testing.T) {
 		t.Fatalf("Changes command wrong: %q", changes.Command)
 	}
 
-	callGraph, ok := findTabByName(tabs, "Go call graph")
+	// Two main packages (cmd/server, cmd/worker) under one module -> two
+	// disambiguated Call graph tabs, each targeting exactly one main (the
+	// whole point: go-callvis errors on a pattern matching more than one).
+	callGraphServer, ok := findTabByName(tabs, "Call graph (cmd/server)")
 	if !ok {
-		t.Fatalf("missing Go call graph tab: %+v", tabs)
+		t.Fatalf("missing Call graph (cmd/server) tab: %+v", tabs)
 	}
-	if callGraph.Dir != "services/api" || len(callGraph.Requires) == 0 || callGraph.Requires[0] != "go-callvis" {
-		t.Fatalf("Go call graph tab wrong: %+v", callGraph)
+	if callGraphServer.Renderer != "map" || callGraphServer.Kind != manifest.KindGenerator {
+		t.Fatalf("Call graph (cmd/server) tab wrong: %+v", callGraphServer)
 	}
-	if strings.Contains(callGraph.Command, "-focus") {
-		t.Fatalf("default go-callvis command must omit -focus (R13): %q", callGraph.Command)
+	if callGraphServer.Dir != "" {
+		t.Fatalf("Call graph tab must run from the repo root (no Dir), got %q", callGraphServer.Dir)
+	}
+	if len(callGraphServer.Requires) == 0 || callGraphServer.Requires[0] != "go-callvis" {
+		t.Fatalf("Call graph (cmd/server) tab missing go-callvis requirement: %+v", callGraphServer)
+	}
+	if !strings.Contains(callGraphServer.Command, "observer gen callgraphmodel") ||
+		!strings.Contains(callGraphServer.Command, "--dir 'services/api'") ||
+		!strings.Contains(callGraphServer.Command, "--main 'cmd/server'") {
+		t.Fatalf("Call graph (cmd/server) command wrong: %q", callGraphServer.Command)
+	}
+
+	callGraphWorker, ok := findTabByName(tabs, "Call graph (cmd/worker)")
+	if !ok {
+		t.Fatalf("missing Call graph (cmd/worker) tab: %+v", tabs)
+	}
+	if !strings.Contains(callGraphWorker.Command, "--main 'cmd/worker'") {
+		t.Fatalf("Call graph (cmd/worker) command wrong: %q", callGraphWorker.Command)
+	}
+	if callGraphServer.Output == callGraphWorker.Output {
+		t.Fatalf("Call graph tabs must have disambiguated output files, both got %q", callGraphServer.Output)
 	}
 
 	svcMap, ok := findTabByName(tabs, "Service map")
@@ -170,9 +194,26 @@ func TestDefaultTabsServicePlus(t *testing.T) {
 		t.Fatalf("missing/incorrect Service map tab for servicePlus: %+v (ok=%v)", svcMap, ok)
 	}
 
-	callGraph, ok := findTabByName(tabs, "Go call graph")
-	if !ok || callGraph.Dir != "services/api" {
-		t.Fatalf("missing/incorrect Go call graph tab: %+v (ok=%v)", callGraph, ok)
+	// servicePlus's services/api module has four "package main" dirs
+	// (cmd/server, cmd/retention-sweeper, scripts/bootstrap_billing,
+	// scripts/migrate-projects-to-tenant-db) — DefaultTabs must emit one
+	// disambiguated Call graph tab per main rather than erroring the way
+	// go-callvis itself does on "./..." with more than one main.
+	var callGraphTabs []manifest.Tab
+	for _, tab := range tabs {
+		if strings.HasPrefix(tab.Name, "Call graph") {
+			callGraphTabs = append(callGraphTabs, tab)
+		}
+	}
+	if len(callGraphTabs) < 2 {
+		t.Fatalf("expected multiple Call graph tabs for servicePlus's multi-main services/api module, got %+v", callGraphTabs)
+	}
+	callGraphServer, ok := findTabByName(tabs, "Call graph (cmd/server)")
+	if !ok || callGraphServer.Renderer != "map" {
+		t.Fatalf("missing/incorrect Call graph (cmd/server) tab: %+v (ok=%v)", callGraphServer, ok)
+	}
+	if !strings.Contains(callGraphServer.Command, "--dir 'services/api'") {
+		t.Fatalf("Call graph (cmd/server) command missing --dir 'services/api': %q", callGraphServer.Command)
 	}
 
 	var dbTabs []manifest.Tab

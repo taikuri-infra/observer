@@ -340,6 +340,7 @@
     external: "var(--map-external)",
     table: "var(--map-table)",
     module: "var(--map-module)",
+    func: "var(--map-func)",
   };
   var MAP_KIND_NAME = {
     entry: "Entry / HTTP",
@@ -348,6 +349,7 @@
     external: "External",
     table: "Table",
     module: "Module",
+    func: "Function",
   };
   var MAP_KIND_GLYPH = {
     entry: "⇄",
@@ -356,8 +358,9 @@
     external: "◇",
     table: "▦",
     module: "▣",
+    func: "ƒ",
   };
-  var MAP_KIND_ORDER = ["entry", "service", "adapter", "external", "table", "module"];
+  var MAP_KIND_ORDER = ["entry", "service", "adapter", "external", "table", "module", "func"];
   // Human labels for the meta.sizeBy/colorBy metric keys (legend text).
   // Unknown keys fall back to the raw key, so a future runtime metric
   // (reqPerSec, latencyMs, …) still labels sensibly.
@@ -366,6 +369,8 @@
     imports: "imports (out-degree)",
     churn: "churn",
     loc: "lines of code",
+    callers: "callers (in-degree)",
+    callees: "callees (out-degree)",
   };
   function mapMetricLabel(key) {
     return MAP_METRIC_LABEL[key] || key;

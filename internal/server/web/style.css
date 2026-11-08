@@ -21,6 +21,7 @@
   --map-external: #d98cff;
   --map-table: #4fbf84;
   --map-module: #f2994a;
+  --map-func: #e85d9c;
   --map-calm: var(--ok);
   --map-warm: #e8b23a;
   --map-hot: var(--danger);

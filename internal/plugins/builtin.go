@@ -34,15 +34,18 @@ func filterSafeRel(paths []string) []string {
 // DefaultTabs detects repo's structure and returns observer's built-in tab
 // set: Overview, Service map + Changes (always; Service map replaces the
 // old Go deps tab and sits 2nd, right after Overview), Database (per
-// detected SQL migrations dir, also canvas-rendered), Go call graph (per
-// detected Go module), Frontend deps (per detected frontend package, also
-// canvas-rendered), and Hotspots (always).
+// detected SQL migrations dir, also canvas-rendered), Call graph (per
+// detected Go *main package*, also canvas-rendered — see goCallGraphTabs),
+// Frontend deps (per detected frontend package, also canvas-rendered), and
+// Hotspots (always).
 //
 // Module detection walks repo up to depth 3 (skipping node_modules/vendor/
-// .git) for nested go.mod/package.json files. Migrations directories are
-// then searched for within each detected Go module's own subtree (any
-// depth — e.g. servicePlus's tenant_migrations lives 4 levels under its
-// services/api Go module).
+// .git) for nested go.mod/package.json files. Migrations directories and
+// main packages are then searched for within each detected Go module's own
+// subtree (any depth — e.g. servicePlus's tenant_migrations lives 4 levels
+// under its services/api Go module, and that same module has four
+// "package main" directories: cmd/server, cmd/retention-sweeper, and two
+// scripts/ one-shot tools).
 func DefaultTabs(repo string) ([]manifest.Tab, error) {
 	goModules, err := findModuleDirs(repo, "go.mod", 3)
 	if err != nil {
@@ -77,7 +80,11 @@ func DefaultTabs(repo string) ([]manifest.Tab, error) {
 	migrationsDirs = filterSafeRel(migrationsDirs)
 
 	tabs = append(tabs, databaseTabs(migrationsDirs)...)
-	tabs = append(tabs, goCallGraphTabs(goModules)...)
+	callGraphTabs, err := goCallGraphTabs(repo, goModules)
+	if err != nil {
+		return nil, fmt.Errorf("detect go main packages: %w", err)
+	}
+	tabs = append(tabs, callGraphTabs...)
 	tabs = append(tabs, frontendDepsTabs(repo, frontendModules)...)
 	tabs = append(tabs, hotspotsTab())
 
@@ -169,24 +176,57 @@ func databaseTabs(migrationsDirs []string) []manifest.Tab {
 	return tabs
 }
 
-// goCallGraphTabs uses the external go-callvis tool — one per detected Go
-// module. R13: the default command omits -focus.
-func goCallGraphTabs(goModules []string) []manifest.Tab {
-	var tabs []manifest.Tab
+// mainPkgRef pairs a detected "package main" directory with the Go module
+// it lives under, both repo-relative — goCallGraphTabs' unit of work (one
+// tab per mainPkgRef, never per module: see its doc comment for why).
+type mainPkgRef struct {
+	mod string
+	dir string // the main package's directory, relative to mod
+}
+
+// goCallGraphTabs replaces the old graphviz-SVG "Go call graph" pipeline
+// (go-callvis -format svg -file ... ./...), which erred with "found
+// multiple packages with name: main" on any module with more than one main
+// (e.g. servicePlus's services/api: cmd/server, cmd/retention-sweeper, and
+// two scripts/ tools). It emits one renderer:"map" tab PER DETECTED MAIN
+// PACKAGE instead of per module — `observer gen callgraphmodel --dir <mod>
+// --main <mainDir>` targets exactly one main, which is both how the
+// multi-main error is avoided and how the call graph ends up on the canvas
+// map renderer like every other tab (service map, database, frontend
+// deps) rather than a static graphviz SVG.
+//
+// No Dir is set on the tab (same reasoning as serviceMapTabs/
+// frontendDepsTabs): gen callgraphmodel's --dir/--main are repo-root-
+// relative command-line flags, so the command runs from the repo root.
+func goCallGraphTabs(repo string, goModules []string) ([]manifest.Tab, error) {
+	var mains []mainPkgRef
 	for _, mod := range goModules {
-		out := outputName("callgraph.svg", mod, len(goModules))
-		stem := strings.TrimSuffix(out, ".svg")
+		found, err := findMainPackageDirs(filepath.Join(repo, mod))
+		if err != nil {
+			return nil, fmt.Errorf("detect main packages under %s: %w", mod, err)
+		}
+		found = filterSafeRel(found)
+		for _, d := range found {
+			mains = append(mains, mainPkgRef{mod: mod, dir: d})
+		}
+	}
+
+	var tabs []manifest.Tab
+	for _, m := range mains {
+		out := outputName("callgraph-map.json", m.dir, len(mains))
 		tabs = append(tabs, manifest.Tab{
-			Name:     tabName("Go call graph", mod, len(goModules)),
-			Kind:     manifest.KindGenerator,
-			Command:  fmt.Sprintf("go-callvis -format svg -file '%sobs-data/%s' -nostd ./...", upPath(mod), stem),
+			Name: tabName("Call graph", m.dir, len(mains)),
+			Kind: manifest.KindGenerator,
+			Command: fmt.Sprintf(
+				"observer gen callgraphmodel --dir '%s' --main '%s' --out 'obs-data/%s'",
+				m.mod, m.dir, out,
+			),
 			Output:   out,
-			Dir:      mod,
-			Renderer: "svg",
+			Renderer: "map",
 			Requires: []string{"go-callvis"},
 		})
 	}
-	return tabs
+	return tabs, nil
 }
 
 // serviceMapTabs is native (observer gen graphmodel) — one per detected Go
