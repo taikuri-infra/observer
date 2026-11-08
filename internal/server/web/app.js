@@ -215,6 +215,11 @@
   // ---- Renderers, dispatched by tab.renderer ----
 
   function renderArtifact(tab, text) {
+    // The map renderer owns the whole content area (its own rail + canvas,
+    // no outer scroll) — every other renderer uses the padded, scrollable
+    // default. Toggled on every dispatch so leaving the map tab restores
+    // normal layout.
+    els.content.classList.toggle("content--map", tab.renderer === "map");
     switch (tab.renderer) {
       case "markdown":
         return renderMarkdown(text);
@@ -224,6 +229,8 @@
         return renderMermaid(text);
       case "graph":
         return renderGraph(text);
+      case "map":
+        return renderMap(text);
       case "table":
         return renderTable(text);
       case "dbml":
@@ -311,6 +318,716 @@
       state.vizInstance = viz;
       return viz;
     });
+  }
+
+  // ---- Service map renderer ("map") ----
+  //
+  // Ported from the design mockup (observer-dagre.html): real dagre
+  // hierarchical layout, SVG/CSS nodes & edges, filter rail, pan/zoom,
+  // neighbour-focus, and a detail side panel. The artifact is graph.json
+  // (see docs/superpowers/specs/2026-11-08-canvas-service-map-design.md
+  // §4) — already carries precomputed metrics/location/description/links,
+  // so (unlike the mockup) this renderer does no degree/doc computation of
+  // its own, only layout and drawing.
+  //
+  // Security: every dynamic string (ids, labels, doc text, task ids) is set
+  // via textContent, never innerHTML/outerHTML — this renderer never calls
+  // safeHTML/safeSVG because it never builds HTML from strings at all.
+  var MAP_KIND_VAR = {
+    entry: "var(--map-entry)",
+    service: "var(--map-service)",
+    adapter: "var(--map-adapter)",
+    external: "var(--map-external)",
+  };
+  var MAP_KIND_NAME = {
+    entry: "Entry / HTTP",
+    service: "Application",
+    adapter: "Adapter / DB",
+    external: "External",
+  };
+  var MAP_KIND_GLYPH = { entry: "⇄", service: "◆", adapter: "⌿", external: "◇" };
+  var MAP_KIND_ORDER = ["entry", "service", "adapter", "external"];
+
+  function mapHeatColor(churn) {
+    if (churn >= 60) return "var(--map-hot)";
+    if (churn >= 25) return "var(--map-warm)";
+    return "var(--map-calm)";
+  }
+
+  function svgEl(tag, attrs) {
+    var e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (var k in attrs) {
+      if (Object.prototype.hasOwnProperty.call(attrs, k)) e.setAttribute(k, attrs[k]);
+    }
+    return e;
+  }
+
+  function mapEdgePath(points) {
+    if (!points || points.length < 2) return "";
+    var d = "M" + points[0].x + "," + points[0].y;
+    for (var i = 1; i < points.length; i++) {
+      var p = points[i],
+        prev = points[i - 1],
+        mx = (prev.x + p.x) / 2,
+        my = (prev.y + p.y) / 2;
+      d += " Q" + prev.x + "," + prev.y + " " + mx + "," + my;
+    }
+    var last = points[points.length - 1];
+    d += " L" + last.x + "," + last.y;
+    return d;
+  }
+
+  function renderMap(text) {
+    var data;
+    try {
+      data = JSON.parse(text);
+    } catch (err) {
+      return renderRaw(text);
+    }
+    if (!data || !Array.isArray(data.nodes)) {
+      els.content.innerHTML = '<div class="error-banner">graph.json has no "nodes" array</div>';
+      return;
+    }
+    var nodes = data.nodes;
+    var edges = Array.isArray(data.edges) ? data.edges : [];
+
+    if (!window.dagre) {
+      els.content.innerHTML = '<div class="error-banner">dagre.js not available</div>';
+      return;
+    }
+
+    var byId = {};
+    var maxDependents = 1;
+    nodes.forEach(function (n) {
+      byId[n.id] = n;
+      var dep = (n.metrics && n.metrics.dependents) || 0;
+      if (dep > maxDependents) maxDependents = dep;
+    });
+    function radiusFor(n) {
+      var dep = (n.metrics && n.metrics.dependents) || 0;
+      return 9 + 17 * (dep / maxDependents);
+    }
+    function churnFor(n) {
+      return (n.metrics && n.metrics.churn) || 0;
+    }
+
+    // ---- DOM scaffold ----
+    var root = document.createElement("div");
+    root.className = "render-map";
+
+    var rail = document.createElement("aside");
+    rail.className = "map-rail";
+
+    var searchWrap = document.createElement("div");
+    var searchLabel = document.createElement("h4");
+    searchLabel.textContent = "Filter";
+    var search = document.createElement("input");
+    search.className = "map-search";
+    search.type = "text";
+    search.placeholder = "Filter packages…";
+    searchWrap.appendChild(searchLabel);
+    searchWrap.appendChild(search);
+    rail.appendChild(searchWrap);
+
+    var kindCounts = {};
+    nodes.forEach(function (n) {
+      kindCounts[n.kind] = (kindCounts[n.kind] || 0) + 1;
+    });
+    var activeKinds = {};
+    var kindWrap = document.createElement("div");
+    var kindLabel = document.createElement("h4");
+    kindLabel.textContent = "Kind";
+    kindWrap.appendChild(kindLabel);
+    var chips = document.createElement("div");
+    chips.className = "map-chips";
+    MAP_KIND_ORDER.filter(function (k) {
+      return kindCounts[k] > 0;
+    }).forEach(function (k) {
+      activeKinds[k] = true;
+      var chip = document.createElement("div");
+      chip.className = "map-chip on";
+      chip.dataset.kind = k;
+      var sw = document.createElement("span");
+      sw.className = "sw";
+      sw.style.background = MAP_KIND_VAR[k];
+      var label = document.createElement("span");
+      label.textContent = MAP_KIND_NAME[k] || k;
+      var ct = document.createElement("span");
+      ct.className = "ct";
+      ct.textContent = String(kindCounts[k]);
+      chip.appendChild(sw);
+      chip.appendChild(label);
+      chip.appendChild(ct);
+      chip.addEventListener("click", function () {
+        activeKinds[k] = !activeKinds[k];
+        chip.classList.toggle("on", activeKinds[k]);
+        applyFilters();
+      });
+      chips.appendChild(chip);
+    });
+    kindWrap.appendChild(chips);
+    rail.appendChild(kindWrap);
+
+    var sizeWrap = document.createElement("div");
+    var sizeLabel = document.createElement("h4");
+    sizeLabel.textContent = "Node size — dependents";
+    var sizes = document.createElement("div");
+    sizes.className = "map-legend";
+    var sizesRow = document.createElement("div");
+    sizesRow.className = "map-sizes";
+    [12, 20, 30].forEach(function (px) {
+      var i = document.createElement("i");
+      i.style.width = px + "px";
+      i.style.height = px + "px";
+      sizesRow.appendChild(i);
+    });
+    var sizesNote = document.createElement("span");
+    sizesNote.style.fontSize = "11px";
+    sizesNote.style.color = "var(--text-faint)";
+    sizesNote.style.fontFamily = "var(--mono)";
+    sizesNote.textContent = "in-degree";
+    sizesRow.appendChild(sizesNote);
+    sizes.appendChild(sizesRow);
+    sizeWrap.appendChild(sizeLabel);
+    sizeWrap.appendChild(sizes);
+    rail.appendChild(sizeWrap);
+
+    var heatWrap = document.createElement("div");
+    var heatLabel = document.createElement("h4");
+    heatLabel.textContent = "Ring color — churn";
+    var heatLegend = document.createElement("div");
+    heatLegend.className = "map-legend";
+    var heatbar = document.createElement("div");
+    heatbar.className = "map-heatbar";
+    var heatLabels = document.createElement("div");
+    heatLabels.className = "map-heat-labels";
+    var calmLabel = document.createElement("span");
+    calmLabel.textContent = "calm";
+    var hotLabel = document.createElement("span");
+    hotLabel.textContent = "hot";
+    heatLabels.appendChild(calmLabel);
+    heatLabels.appendChild(hotLabel);
+    heatLegend.appendChild(heatbar);
+    heatLegend.appendChild(heatLabels);
+    heatWrap.appendChild(heatLabel);
+    heatWrap.appendChild(heatLegend);
+    rail.appendChild(heatWrap);
+
+    var layoutWrap = document.createElement("div");
+    var layoutLabel = document.createElement("h4");
+    layoutLabel.textContent = "Layout";
+    var dirSeg = document.createElement("div");
+    dirSeg.className = "map-seg";
+    var btnLR = document.createElement("button");
+    btnLR.type = "button";
+    btnLR.textContent = "L → R";
+    btnLR.className = "on";
+    var btnTB = document.createElement("button");
+    btnTB.type = "button";
+    btnTB.textContent = "Top ↓";
+    dirSeg.appendChild(btnLR);
+    dirSeg.appendChild(btnTB);
+    var modeSeg = document.createElement("div");
+    modeSeg.className = "map-seg";
+    modeSeg.style.marginTop = "6px";
+    var btnHier = document.createElement("button");
+    btnHier.type = "button";
+    btnHier.textContent = "Hierarchical";
+    btnHier.className = "on";
+    btnHier.disabled = true; // the only implemented mode; kept visible+on for clarity
+    var btnForce = document.createElement("button");
+    btnForce.type = "button";
+    btnForce.textContent = "Force";
+    btnForce.disabled = true;
+    btnForce.title =
+      "Force-directed layout is not implemented yet (design spec §6/§11 open question: d3-force vs. a compact custom sim) — TODO for a follow-up.";
+    modeSeg.appendChild(btnHier);
+    modeSeg.appendChild(btnForce);
+    layoutWrap.appendChild(layoutLabel);
+    layoutWrap.appendChild(dirSeg);
+    layoutWrap.appendChild(modeSeg);
+    rail.appendChild(layoutWrap);
+
+    var stage = document.createElement("div");
+    stage.className = "map-stage";
+    var svg = svgEl("svg", { preserveAspectRatio: "xMidYMid meet" });
+    var gEdges = svgEl("g", {});
+    var gNodes = svgEl("g", {});
+    svg.appendChild(gEdges);
+    svg.appendChild(gNodes);
+    var card = document.createElement("div");
+    card.className = "map-card";
+    var hint = document.createElement("div");
+    hint.className = "map-hint";
+    hint.textContent =
+      "Real dagre layout · hover for metrics · click a node for its detail panel · scroll to zoom";
+    var panel = document.createElement("aside");
+    panel.className = "map-panel";
+    var panelInner = document.createElement("div");
+    panelInner.className = "map-panel-inner";
+    panel.appendChild(panelInner);
+
+    stage.appendChild(svg);
+    stage.appendChild(card);
+    stage.appendChild(hint);
+    stage.appendChild(panel);
+
+    root.appendChild(rail);
+    root.appendChild(stage);
+    setContent(root);
+
+    // ---- layout + draw ----
+    var nodeEls = {};
+    var edgeEls = [];
+    var focused = null;
+    var vb = { x: 0, y: 0, w: 1000, h: 640 };
+
+    function runLayout(rankdir) {
+      var g = new window.dagre.graphlib.Graph();
+      g.setGraph({ rankdir: rankdir, nodesep: 24, ranksep: 68, marginx: 36, marginy: 36 });
+      g.setDefaultEdgeLabel(function () {
+        return {};
+      });
+      nodes.forEach(function (n) {
+        var r = radiusFor(n);
+        g.setNode(n.id, { width: r * 2 + 12, height: r * 2 + 12 });
+      });
+      edges.forEach(function (e) {
+        if (byId[e.from] && byId[e.to]) g.setEdge(e.from, e.to);
+      });
+      window.dagre.layout(g);
+      return g;
+    }
+
+    function draw(rankdir) {
+      gEdges.innerHTML = "";
+      gNodes.innerHTML = "";
+      nodeEls = {};
+      edgeEls = [];
+
+      var g = runLayout(rankdir);
+      var gg = g.graph();
+      vb = { x: 0, y: 0, w: gg.width || 1, h: gg.height || 1 };
+      setViewBox();
+
+      g.edges().forEach(function (e) {
+        var pts = g.edge(e).points;
+        var p = svgEl("path", { d: mapEdgePath(pts), class: "map-edge" });
+        gEdges.appendChild(p);
+        edgeEls.push({ el: p, a: e.v, b: e.w });
+      });
+
+      g.nodes().forEach(function (id) {
+        var pos = g.node(id);
+        var n = byId[id];
+        if (!n || !pos) return;
+        var r = radiusFor(n);
+        var color = MAP_KIND_VAR[n.kind] || "var(--text-faint)";
+        var heat = mapHeatColor(churnFor(n));
+
+        var grp = svgEl("g", { class: "map-node", "data-id": id, "data-kind": n.kind });
+        grp.style.color = heat;
+        grp.appendChild(svgEl("circle", { class: "ring", cx: pos.x, cy: pos.y, r: r, stroke: heat }));
+
+        var gl = svgEl("text", {
+          class: "glyph",
+          x: pos.x,
+          y: pos.y + 0.5,
+          "text-anchor": "middle",
+          "dominant-baseline": "central",
+          fill: color,
+        });
+        gl.textContent = MAP_KIND_GLYPH[n.kind] || "●";
+        grp.appendChild(gl);
+
+        var lb = svgEl("text", { class: "label", x: pos.x + r + 6, y: pos.y - 3, "text-anchor": "start" });
+        lb.textContent = n.label || n.id;
+        grp.appendChild(lb);
+
+        var sb = svgEl("text", { class: "sub", x: pos.x + r + 6, y: pos.y + 8, "text-anchor": "start" });
+        sb.textContent = "◂" + ((n.metrics && n.metrics.dependents) || 0) + " ▸" + ((n.metrics && n.metrics.imports) || 0);
+        grp.appendChild(sb);
+
+        gNodes.appendChild(grp);
+        nodeEls[id] = grp;
+
+        grp.addEventListener("mouseenter", function () {
+          showCard(n);
+          highlightNeighbours(id);
+        });
+        grp.addEventListener("mousemove", moveCard);
+        grp.addEventListener("mouseleave", function () {
+          hideCard();
+          if (!focused) clearHighlight();
+        });
+        grp.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          if (focused === id) {
+            focused = null;
+            clearHighlight();
+            closePanel();
+          } else {
+            focused = id;
+            highlightNeighbours(id);
+            openPanel(n);
+          }
+        });
+      });
+
+      applyFilters();
+    }
+
+    svg.addEventListener("click", function () {
+      focused = null;
+      clearHighlight();
+      closePanel();
+    });
+
+    function neighbours(id) {
+      var s = {};
+      s[id] = true;
+      edges.forEach(function (e) {
+        if (e.from === id) s[e.to] = true;
+        if (e.to === id) s[e.from] = true;
+      });
+      return s;
+    }
+    function highlightNeighbours(id) {
+      var nb = neighbours(id);
+      nodes.forEach(function (n) {
+        var g = nodeEls[n.id];
+        if (!g) return;
+        g.classList.toggle("map-dim", !nb[n.id]);
+        g.classList.toggle("map-lit", !!nb[n.id]);
+      });
+      edgeEls.forEach(function (x) {
+        var on = x.a === id || x.b === id;
+        x.el.classList.toggle("map-dim", !on);
+        x.el.classList.toggle("flow", on);
+      });
+    }
+    function clearHighlight() {
+      nodes.forEach(function (n) {
+        var g = nodeEls[n.id];
+        if (g) g.classList.remove("map-dim", "map-lit");
+      });
+      edgeEls.forEach(function (x) {
+        x.el.classList.remove("map-dim", "flow");
+      });
+      applyFilters();
+    }
+
+    function applyFilters() {
+      if (focused) return;
+      var q = search.value.toLowerCase().trim();
+      nodes.forEach(function (n) {
+        var g = nodeEls[n.id];
+        if (!g) return;
+        var vis = activeKinds[n.kind] && (!q || n.id.toLowerCase().indexOf(q) >= 0);
+        g.classList.toggle("map-dim", !vis);
+      });
+      edgeEls.forEach(function (x) {
+        var na = byId[x.a],
+          nb = byId[x.b];
+        var va = na && activeKinds[na.kind] && (!q || x.a.toLowerCase().indexOf(q) >= 0);
+        var vb = nb && activeKinds[nb.kind] && (!q || x.b.toLowerCase().indexOf(q) >= 0);
+        x.el.classList.toggle("map-dim", !(va && vb));
+      });
+    }
+    search.addEventListener("input", applyFilters);
+
+    // ---- hover metric card ----
+    function showCard(n) {
+      card.innerHTML = "";
+      var hd = document.createElement("div");
+      hd.className = "hd";
+      var dot = document.createElement("span");
+      dot.className = "tdot";
+      dot.style.background = MAP_KIND_VAR[n.kind] || "var(--text-faint)";
+      var b = document.createElement("b");
+      b.textContent = n.id;
+      var em = document.createElement("em");
+      em.textContent = MAP_KIND_NAME[n.kind] || n.kind;
+      hd.appendChild(dot);
+      hd.appendChild(b);
+      hd.appendChild(em);
+
+      var metrics = document.createElement("div");
+      metrics.className = "metrics";
+      [
+        ["Dependents", (n.metrics && n.metrics.dependents) || 0],
+        ["Imports", (n.metrics && n.metrics.imports) || 0],
+        ["Churn", (n.metrics && n.metrics.churn) || 0],
+      ].forEach(function (pair) {
+        var cell = document.createElement("div");
+        var k = document.createElement("div");
+        k.className = "k";
+        k.textContent = pair[0];
+        var v = document.createElement("div");
+        v.className = "v";
+        v.textContent = String(pair[1]);
+        cell.appendChild(k);
+        cell.appendChild(v);
+        metrics.appendChild(cell);
+      });
+
+      var foot = document.createElement("div");
+      foot.className = "foot";
+      var hc = document.createElement("span");
+      hc.className = "hc";
+      var churn = churnFor(n);
+      hc.style.background = mapHeatColor(churn);
+      var footText = document.createElement("span");
+      footText.textContent = churn >= 60 ? "High change frequency — refactor risk" : churn >= 25 ? "Moderate change frequency" : "Stable";
+      foot.appendChild(hc);
+      foot.appendChild(footText);
+
+      card.appendChild(hd);
+      card.appendChild(metrics);
+      card.appendChild(foot);
+      card.classList.add("show");
+    }
+    function moveCard(ev) {
+      var b = stage.getBoundingClientRect();
+      var x = ev.clientX - b.left + 16,
+        y = ev.clientY - b.top + 14;
+      if (x + 220 > b.width) x = ev.clientX - b.left - 220;
+      if (y + 140 > b.height) y = b.height - 146;
+      card.style.left = x + "px";
+      card.style.top = y + "px";
+    }
+    function hideCard() {
+      card.classList.remove("show");
+    }
+
+    // ---- detail side panel ----
+    function metricCell(label, value) {
+      var cell = document.createElement("div");
+      cell.className = "cell";
+      var k = document.createElement("div");
+      k.className = "k";
+      k.textContent = label;
+      var v = document.createElement("div");
+      v.className = "v";
+      v.textContent = String(value);
+      cell.appendChild(k);
+      cell.appendChild(v);
+      return cell;
+    }
+
+    function openPanel(n) {
+      panelInner.innerHTML = "";
+      var loc = n.location || {};
+      var desc = n.description || { text: "", source: "none" };
+
+      var ph = document.createElement("div");
+      ph.className = "map-ph";
+      var dot = document.createElement("span");
+      dot.className = "tdot";
+      dot.style.background = MAP_KIND_VAR[n.kind] || "var(--text-faint)";
+      var tt = document.createElement("div");
+      tt.className = "tt";
+      var ttB = document.createElement("b");
+      ttB.textContent = n.id;
+      var ttSpan = document.createElement("span");
+      ttSpan.textContent = MAP_KIND_NAME[n.kind] || n.kind;
+      tt.appendChild(ttB);
+      tt.appendChild(ttSpan);
+      var closeBtn = document.createElement("button");
+      closeBtn.type = "button";
+      closeBtn.className = "close-btn";
+      closeBtn.title = "Close";
+      closeBtn.textContent = "×";
+      closeBtn.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        focused = null;
+        clearHighlight();
+        closePanel();
+      });
+      ph.appendChild(dot);
+      ph.appendChild(tt);
+      ph.appendChild(closeBtn);
+
+      var pb = document.createElement("div");
+      pb.className = "map-pb";
+
+      // Address
+      var addrSec = document.createElement("div");
+      addrSec.className = "map-psec";
+      var addrH = document.createElement("h5");
+      addrH.textContent = "Address";
+      var addr = document.createElement("div");
+      addr.className = "map-addr";
+      var addrPath = document.createTextNode(loc.path || n.id);
+      addr.appendChild(addrPath);
+      if (loc.primaryFile) {
+        addr.appendChild(document.createElement("br"));
+        var pf = document.createElement("small");
+        pf.textContent = loc.primaryFile + (loc.files ? " · " + loc.files + " files" : "");
+        addr.appendChild(pf);
+      } else if (loc.files) {
+        addr.appendChild(document.createElement("br"));
+        var fc = document.createElement("small");
+        fc.textContent = loc.files + " files";
+        addr.appendChild(fc);
+      }
+      addrSec.appendChild(addrH);
+      addrSec.appendChild(addr);
+      pb.appendChild(addrSec);
+
+      // Description
+      var descSec = document.createElement("div");
+      descSec.className = "map-psec";
+      var descH = document.createElement("h5");
+      descH.textContent = "Description";
+      descSec.appendChild(descH);
+      if (desc.source && desc.source !== "none" && desc.text) {
+        var tag = document.createElement("span");
+        tag.className = "map-tag";
+        tag.textContent = desc.source === "observer-annotation" ? "from observer" : "from " + desc.source;
+        var body = document.createElement("div");
+        body.className = "map-desc";
+        body.textContent = desc.text;
+        descSec.appendChild(tag);
+        descSec.appendChild(body);
+      } else {
+        var emptyDoc = document.createElement("div");
+        emptyDoc.className = "map-empty-doc";
+        emptyDoc.textContent =
+          "No description in the code yet. Observer can ask your AI assistant to write a short, structured summary and store it beside the code — so this panel (and search) understand what this package does.";
+        var genBtn = document.createElement("button");
+        genBtn.type = "button";
+        genBtn.className = "map-gen-btn";
+        genBtn.textContent = "✦ Generate with Observer AI";
+        genBtn.title = "Coming soon — the //observer:summary annotation + AI generator skill is a fast follow (design spec §3, non-goals).";
+        genBtn.disabled = true;
+        descSec.appendChild(emptyDoc);
+        descSec.appendChild(genBtn);
+      }
+      pb.appendChild(descSec);
+
+      // Metrics
+      var metSec = document.createElement("div");
+      metSec.className = "map-psec";
+      var metH = document.createElement("h5");
+      metH.textContent = "Metrics";
+      var mrow = document.createElement("div");
+      mrow.className = "map-mrow";
+      var m = n.metrics || {};
+      mrow.appendChild(metricCell("Dependents", m.dependents || 0));
+      mrow.appendChild(metricCell("Imports", m.imports || 0));
+      mrow.appendChild(metricCell("Churn", m.churn || 0));
+      metSec.appendChild(metH);
+      metSec.appendChild(mrow);
+      pb.appendChild(metSec);
+
+      // Linked work
+      var linkSec = document.createElement("div");
+      linkSec.className = "map-psec map-links";
+      var linkH = document.createElement("h5");
+      linkH.textContent = "Linked work";
+      linkSec.appendChild(linkH);
+      var links = Array.isArray(n.links) ? n.links : [];
+      if (links.length === 0) {
+        var noLinks = document.createElement("div");
+        noLinks.className = "map-empty-doc";
+        noLinks.textContent = "No linked work yet.";
+        linkSec.appendChild(noLinks);
+      } else {
+        links.forEach(function (l) {
+          var lk = document.createElement("div");
+          lk.className = "lk";
+          var ic = document.createElement("span");
+          ic.className = "ic";
+          ic.textContent = l.type === "jira" ? "JR" : "SP";
+          var label = document.createElement("span");
+          label.textContent = (l.type === "jira" ? "Jira issue " : "ServicePlus task ") + (l.id || "");
+          var em = document.createElement("em");
+          em.textContent = "connect later";
+          lk.appendChild(ic);
+          lk.appendChild(label);
+          lk.appendChild(em);
+          linkSec.appendChild(lk);
+        });
+      }
+      pb.appendChild(linkSec);
+
+      panelInner.appendChild(ph);
+      panelInner.appendChild(pb);
+      panel.classList.add("open");
+    }
+    function closePanel() {
+      panel.classList.remove("open");
+    }
+
+    // ---- pan / zoom-to-cursor ----
+    function setViewBox() {
+      svg.setAttribute("viewBox", vb.x + " " + vb.y + " " + vb.w + " " + vb.h);
+    }
+    stage.addEventListener(
+      "wheel",
+      function (ev) {
+        ev.preventDefault();
+        var b = svg.getBoundingClientRect();
+        if (b.width === 0 || b.height === 0) return;
+        var mx = vb.x + ((ev.clientX - b.left) / b.width) * vb.w;
+        var my = vb.y + ((ev.clientY - b.top) / b.height) * vb.h;
+        var f = ev.deltaY < 0 ? 0.88 : 1.14;
+        var nw = vb.w * f,
+          nh = vb.h * f;
+        vb.x = mx - (mx - vb.x) * (nw / vb.w);
+        vb.y = my - (my - vb.y) * (nh / vb.h);
+        vb.w = nw;
+        vb.h = nh;
+        setViewBox();
+      },
+      { passive: false }
+    );
+    var dragging = false,
+      lastX = 0,
+      lastY = 0;
+    stage.addEventListener("pointerdown", function (ev) {
+      dragging = true;
+      lastX = ev.clientX;
+      lastY = ev.clientY;
+      stage.classList.add("grabbing");
+    });
+    stage.addEventListener("pointermove", function (ev) {
+      if (!dragging) return;
+      var b = svg.getBoundingClientRect();
+      if (b.width === 0 || b.height === 0) return;
+      vb.x -= ((ev.clientX - lastX) / b.width) * vb.w;
+      vb.y -= ((ev.clientY - lastY) / b.height) * vb.h;
+      lastX = ev.clientX;
+      lastY = ev.clientY;
+      setViewBox();
+    });
+    function stopDrag() {
+      dragging = false;
+      stage.classList.remove("grabbing");
+    }
+    stage.addEventListener("pointerup", stopDrag);
+    stage.addEventListener("pointerleave", stopDrag);
+
+    // ---- direction toggle ----
+    var curDir = "LR";
+    function selectDir(dir, btn) {
+      btnLR.classList.remove("on");
+      btnTB.classList.remove("on");
+      btn.classList.add("on");
+      curDir = dir;
+      focused = null;
+      closePanel();
+      draw(curDir);
+    }
+    btnLR.addEventListener("click", function () {
+      selectDir("LR", btnLR);
+    });
+    btnTB.addEventListener("click", function () {
+      selectDir("TB", btnTB);
+    });
+
+    draw(curDir);
   }
 
   function renderTable(text) {
