@@ -215,6 +215,11 @@
   // ---- Renderers, dispatched by tab.renderer ----
 
   function renderArtifact(tab, text) {
+    // The map renderer owns the whole content area (its own rail + canvas,
+    // no outer scroll) — every other renderer uses the padded, scrollable
+    // default. Toggled on every dispatch so leaving the map tab restores
+    // normal layout.
+    els.content.classList.toggle("content--map", tab.renderer === "map");
     switch (tab.renderer) {
       case "markdown":
         return renderMarkdown(text);
@@ -224,6 +229,8 @@
         return renderMermaid(text);
       case "graph":
         return renderGraph(text);
+      case "map":
+        return renderMap(text);
       case "table":
         return renderTable(text);
       case "dbml":
@@ -311,6 +318,905 @@
       state.vizInstance = viz;
       return viz;
     });
+  }
+
+  // ---- Service map renderer ("map") ----
+  //
+  // Ported from the design mockup (observer-dagre.html): real dagre
+  // hierarchical layout, SVG/CSS nodes & edges, filter rail, pan/zoom,
+  // neighbour-focus, and a detail side panel. The artifact is graph.json
+  // (see docs/superpowers/specs/2026-11-08-canvas-service-map-design.md
+  // §4) — already carries precomputed metrics/location/description/links,
+  // so (unlike the mockup) this renderer does no degree/doc computation of
+  // its own, only layout and drawing.
+  //
+  // Security: every dynamic string (ids, labels, doc text, task ids) is set
+  // via textContent, never innerHTML/outerHTML — this renderer never calls
+  // safeHTML/safeSVG because it never builds HTML from strings at all.
+  var MAP_KIND_VAR = {
+    entry: "var(--map-entry)",
+    service: "var(--map-service)",
+    adapter: "var(--map-adapter)",
+    external: "var(--map-external)",
+  };
+  var MAP_KIND_NAME = {
+    entry: "Entry / HTTP",
+    service: "Application",
+    adapter: "Adapter / DB",
+    external: "External",
+  };
+  var MAP_KIND_GLYPH = { entry: "⇄", service: "◆", adapter: "⌿", external: "◇" };
+  var MAP_KIND_ORDER = ["entry", "service", "adapter", "external"];
+  // Human labels for the meta.sizeBy/colorBy metric keys (legend text).
+  // Unknown keys fall back to the raw key, so a future runtime metric
+  // (reqPerSec, latencyMs, …) still labels sensibly.
+  var MAP_METRIC_LABEL = {
+    dependents: "dependents (in-degree)",
+    imports: "imports (out-degree)",
+    churn: "churn",
+    loc: "lines of code",
+  };
+  function mapMetricLabel(key) {
+    return MAP_METRIC_LABEL[key] || key;
+  }
+
+  function svgEl(tag, attrs) {
+    var e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (var k in attrs) {
+      if (Object.prototype.hasOwnProperty.call(attrs, k)) e.setAttribute(k, attrs[k]);
+    }
+    return e;
+  }
+
+  function mapEdgePath(points) {
+    if (!points || points.length < 2) return "";
+    var d = "M" + points[0].x + "," + points[0].y;
+    for (var i = 1; i < points.length; i++) {
+      var p = points[i],
+        prev = points[i - 1],
+        mx = (prev.x + p.x) / 2,
+        my = (prev.y + p.y) / 2;
+      d += " Q" + prev.x + "," + prev.y + " " + mx + "," + my;
+    }
+    var last = points[points.length - 1];
+    d += " L" + last.x + "," + last.y;
+    return d;
+  }
+
+  function renderMap(text) {
+    var data;
+    try {
+      data = JSON.parse(text);
+    } catch (err) {
+      return renderRaw(text);
+    }
+    if (!data || !Array.isArray(data.nodes)) {
+      els.content.innerHTML = '<div class="error-banner">graph.json has no "nodes" array</div>';
+      return;
+    }
+    var nodes = data.nodes;
+    var edges = Array.isArray(data.edges) ? data.edges : [];
+
+    if (!window.dagre) {
+      els.content.innerHTML = '<div class="error-banner">dagre.js not available</div>';
+      return;
+    }
+
+    // Honor the meta seam: node size is driven by meta.sizeBy and ring
+    // color by meta.colorBy, so a future adapter emitting runtime metrics
+    // (reqPerSec/latencyMs/errorRate) reuses this renderer unchanged — only
+    // meta changes. Color is NORMALIZED to the graph's current max for the
+    // colorBy metric (not absolute churn thresholds), so any metric's range
+    // maps onto the calm→hot ramp.
+    var meta = data.meta || {};
+    var sizeByKey = meta.sizeBy || "dependents";
+    var colorByKey = meta.colorBy || "churn";
+
+    // Repo ids are attacker-influenced strings (a package literally named
+    // "__proto__" is legal); Object.create(null) keeps such a key from
+    // colliding with Object.prototype and corrupting lookups.
+    var byId = Object.create(null);
+    var maxSize = 1; // >=1 so radiusFor never divides by zero
+    var maxColor = 0; // 0 => every ring calm (no colorBy signal)
+    function metricVal(n, key) {
+      return n.metrics && typeof n.metrics[key] === "number" ? n.metrics[key] : 0;
+    }
+    nodes.forEach(function (n) {
+      byId[n.id] = n;
+      var s = metricVal(n, sizeByKey);
+      if (s > maxSize) maxSize = s;
+      var c = metricVal(n, colorByKey);
+      if (c > maxColor) maxColor = c;
+    });
+    function radiusFor(n) {
+      return 9 + 17 * (metricVal(n, sizeByKey) / maxSize);
+    }
+    function colorFrac(n) {
+      return maxColor > 0 ? metricVal(n, colorByKey) / maxColor : 0;
+    }
+    function heatColor(n) {
+      var f = colorFrac(n);
+      return f >= 0.66 ? "var(--map-hot)" : f >= 0.33 ? "var(--map-warm)" : "var(--map-calm)";
+    }
+
+    // ---- DOM scaffold ----
+    var root = document.createElement("div");
+    root.className = "render-map";
+
+    var rail = document.createElement("aside");
+    rail.className = "map-rail";
+
+    var searchWrap = document.createElement("div");
+    var searchLabel = document.createElement("h4");
+    searchLabel.textContent = "Filter";
+    var search = document.createElement("input");
+    search.className = "map-search";
+    search.type = "text";
+    search.placeholder = "Filter packages…";
+    searchWrap.appendChild(searchLabel);
+    searchWrap.appendChild(search);
+    rail.appendChild(searchWrap);
+
+    var kindCounts = Object.create(null);
+    nodes.forEach(function (n) {
+      kindCounts[n.kind] = (kindCounts[n.kind] || 0) + 1;
+    });
+    var activeKinds = Object.create(null);
+    var kindWrap = document.createElement("div");
+    var kindLabel = document.createElement("h4");
+    kindLabel.textContent = "Kind";
+    kindWrap.appendChild(kindLabel);
+    var chips = document.createElement("div");
+    chips.className = "map-chips";
+    MAP_KIND_ORDER.filter(function (k) {
+      return kindCounts[k] > 0;
+    }).forEach(function (k) {
+      activeKinds[k] = true;
+      var chip = document.createElement("div");
+      chip.className = "map-chip on";
+      chip.dataset.kind = k;
+      var sw = document.createElement("span");
+      sw.className = "sw";
+      sw.style.background = MAP_KIND_VAR[k];
+      var label = document.createElement("span");
+      label.textContent = MAP_KIND_NAME[k] || k;
+      var ct = document.createElement("span");
+      ct.className = "ct";
+      ct.textContent = String(kindCounts[k]);
+      chip.appendChild(sw);
+      chip.appendChild(label);
+      chip.appendChild(ct);
+      chip.addEventListener("click", function () {
+        activeKinds[k] = !activeKinds[k];
+        chip.classList.toggle("on", activeKinds[k]);
+        applyFilters();
+      });
+      chips.appendChild(chip);
+    });
+    kindWrap.appendChild(chips);
+    rail.appendChild(kindWrap);
+
+    var sizeWrap = document.createElement("div");
+    var sizeLabel = document.createElement("h4");
+    sizeLabel.textContent = "Node size — " + mapMetricLabel(sizeByKey);
+    var sizes = document.createElement("div");
+    sizes.className = "map-legend";
+    var sizesRow = document.createElement("div");
+    sizesRow.className = "map-sizes";
+    [12, 20, 30].forEach(function (px) {
+      var i = document.createElement("i");
+      i.style.width = px + "px";
+      i.style.height = px + "px";
+      sizesRow.appendChild(i);
+    });
+    var sizesNote = document.createElement("span");
+    sizesNote.style.fontSize = "11px";
+    sizesNote.style.color = "var(--text-faint)";
+    sizesNote.style.fontFamily = "var(--mono)";
+    sizesNote.textContent = sizeByKey;
+    sizesRow.appendChild(sizesNote);
+    sizes.appendChild(sizesRow);
+    sizeWrap.appendChild(sizeLabel);
+    sizeWrap.appendChild(sizes);
+    rail.appendChild(sizeWrap);
+
+    var heatWrap = document.createElement("div");
+    var heatLabel = document.createElement("h4");
+    heatLabel.textContent = "Ring color — " + mapMetricLabel(colorByKey);
+    var heatLegend = document.createElement("div");
+    heatLegend.className = "map-legend";
+    var heatbar = document.createElement("div");
+    heatbar.className = "map-heatbar";
+    var heatLabels = document.createElement("div");
+    heatLabels.className = "map-heat-labels";
+    var calmLabel = document.createElement("span");
+    calmLabel.textContent = "calm";
+    var hotLabel = document.createElement("span");
+    hotLabel.textContent = "hot";
+    heatLabels.appendChild(calmLabel);
+    heatLabels.appendChild(hotLabel);
+    heatLegend.appendChild(heatbar);
+    heatLegend.appendChild(heatLabels);
+    heatWrap.appendChild(heatLabel);
+    heatWrap.appendChild(heatLegend);
+    rail.appendChild(heatWrap);
+
+    var layoutWrap = document.createElement("div");
+    var layoutLabel = document.createElement("h4");
+    layoutLabel.textContent = "Layout";
+    var dirSeg = document.createElement("div");
+    dirSeg.className = "map-seg";
+    var btnLR = document.createElement("button");
+    btnLR.type = "button";
+    btnLR.textContent = "L → R";
+    btnLR.className = "on";
+    var btnTB = document.createElement("button");
+    btnTB.type = "button";
+    btnTB.textContent = "Top ↓";
+    dirSeg.appendChild(btnLR);
+    dirSeg.appendChild(btnTB);
+    var modeSeg = document.createElement("div");
+    modeSeg.className = "map-seg";
+    modeSeg.style.marginTop = "6px";
+    var btnHier = document.createElement("button");
+    btnHier.type = "button";
+    btnHier.textContent = "Hierarchical";
+    var btnForce = document.createElement("button");
+    btnForce.type = "button";
+    btnForce.textContent = "Force";
+    if (!window.d3 || typeof window.d3.forceSimulation !== "function") {
+      // d3-force failed to load — keep hierarchical only rather than a dead toggle.
+      btnForce.disabled = true;
+      btnForce.title = "d3-force not available";
+    }
+    modeSeg.appendChild(btnHier);
+    modeSeg.appendChild(btnForce);
+    layoutWrap.appendChild(layoutLabel);
+    layoutWrap.appendChild(dirSeg);
+    layoutWrap.appendChild(modeSeg);
+    rail.appendChild(layoutWrap);
+
+    var stage = document.createElement("div");
+    stage.className = "map-stage";
+    var svg = svgEl("svg", { preserveAspectRatio: "xMidYMid meet" });
+    var gEdges = svgEl("g", {});
+    var gNodes = svgEl("g", {});
+    svg.appendChild(gEdges);
+    svg.appendChild(gNodes);
+    var card = document.createElement("div");
+    card.className = "map-card";
+    var hint = document.createElement("div");
+    hint.className = "map-hint";
+    hint.textContent =
+      "Hover for metrics · click a node for its detail panel · drag to pan · scroll to zoom";
+    var panel = document.createElement("aside");
+    panel.className = "map-panel";
+    var panelInner = document.createElement("div");
+    panelInner.className = "map-panel-inner";
+    panel.appendChild(panelInner);
+
+    stage.appendChild(svg);
+    stage.appendChild(card);
+    stage.appendChild(hint);
+    stage.appendChild(panel);
+
+    root.appendChild(rail);
+    root.appendChild(stage);
+    setContent(root);
+
+    // ---- layout + draw ----
+    var nodeEls = Object.create(null);
+    var edgeEls = [];
+    var focused = null;
+    var vb = { x: 0, y: 0, w: 1000, h: 640 };
+    var baseW = 1000,
+      baseH = 640; // last layout's extent, for zoom clamping
+    // Start in the layout meta asks for (defaults to hierarchical). Force
+    // is only honored when d3-force actually loaded.
+    var forceAvailable = !!(window.d3 && typeof window.d3.forceSimulation === "function");
+    var layoutMode = meta.defaultLayout === "force" && forceAvailable ? "force" : "hierarchical";
+    var curDir = "LR";
+    var dragMoved = false; // set by a real pan; read by the svg background-click handler
+
+    // hierarchicalLayout runs dagre and returns a renderer-neutral result:
+    // { width, height, pos: {id:{x,y}}, links: [{a,b,points:[…]}] }.
+    function hierarchicalLayout(rankdir) {
+      var g = new window.dagre.graphlib.Graph();
+      g.setGraph({ rankdir: rankdir, nodesep: 24, ranksep: 68, marginx: 36, marginy: 36 });
+      g.setDefaultEdgeLabel(function () {
+        return {};
+      });
+      nodes.forEach(function (n) {
+        var r = radiusFor(n);
+        g.setNode(n.id, { width: r * 2 + 12, height: r * 2 + 12 });
+      });
+      edges.forEach(function (e) {
+        if (byId[e.from] && byId[e.to]) g.setEdge(e.from, e.to);
+      });
+      window.dagre.layout(g);
+      var gg = g.graph();
+      var pos = Object.create(null);
+      g.nodes().forEach(function (id) {
+        var p = g.node(id);
+        if (p) pos[id] = { x: p.x, y: p.y };
+      });
+      var links = g.edges().map(function (e) {
+        return { a: e.v, b: e.w, points: g.edge(e).points };
+      });
+      return { width: gg.width || 1, height: gg.height || 1, pos: pos, links: links };
+    }
+
+    // forceLayout runs a d3-force simulation SYNCHRONOUSLY for a fixed tick
+    // budget then reads final positions — no continuous animation, no timer
+    // left running. Edges become straight lines between node centers. Same
+    // neutral result shape as hierarchicalLayout.
+    function forceLayout() {
+      var d3 = window.d3;
+      var simNodes = nodes.map(function (n) {
+        return { id: n.id, r: radiusFor(n) };
+      });
+      var idx = Object.create(null);
+      simNodes.forEach(function (sn) {
+        idx[sn.id] = sn;
+      });
+      var simLinks = [];
+      edges.forEach(function (e) {
+        if (idx[e.from] && idx[e.to]) simLinks.push({ source: e.from, target: e.to });
+      });
+      var sim = d3
+        .forceSimulation(simNodes)
+        .force(
+          "link",
+          d3
+            .forceLink(simLinks)
+            .id(function (d) {
+              return d.id;
+            })
+            .distance(96)
+            .strength(0.35)
+        )
+        .force("charge", d3.forceManyBody().strength(-280))
+        .force("center", d3.forceCenter(0, 0))
+        .force(
+          "collide",
+          d3.forceCollide().radius(function (d) {
+            return d.r + 10;
+          })
+        )
+        .stop();
+      for (var i = 0; i < 300; i++) sim.tick();
+
+      // Translate so the whole graph sits at a positive margin, and derive
+      // the viewBox extent.
+      var margin = 48;
+      var minX = Infinity,
+        minY = Infinity,
+        maxX = -Infinity,
+        maxY = -Infinity;
+      simNodes.forEach(function (sn) {
+        minX = Math.min(minX, sn.x - sn.r);
+        minY = Math.min(minY, sn.y - sn.r);
+        maxX = Math.max(maxX, sn.x + sn.r);
+        maxY = Math.max(maxY, sn.y + sn.r);
+      });
+      if (!isFinite(minX)) {
+        minX = minY = 0;
+        maxX = maxY = 1;
+      }
+      var pos = Object.create(null);
+      simNodes.forEach(function (sn) {
+        pos[sn.id] = { x: sn.x - minX + margin, y: sn.y - minY + margin };
+      });
+      var links = simLinks.map(function (l) {
+        var a = typeof l.source === "object" ? l.source.id : l.source;
+        var b = typeof l.target === "object" ? l.target.id : l.target;
+        return { a: a, b: b, points: [pos[a], pos[b]] };
+      });
+      return {
+        width: maxX - minX + 2 * margin,
+        height: maxY - minY + 2 * margin,
+        pos: pos,
+        links: links,
+      };
+    }
+
+    function computeLayout() {
+      if (layoutMode === "force" && forceAvailable) return forceLayout();
+      return hierarchicalLayout(curDir);
+    }
+
+    function draw() {
+      gEdges.innerHTML = "";
+      gNodes.innerHTML = "";
+      nodeEls = Object.create(null);
+      edgeEls = [];
+
+      var layout = computeLayout();
+      baseW = layout.width;
+      baseH = layout.height;
+      vb = { x: 0, y: 0, w: layout.width, h: layout.height };
+      setViewBox();
+
+      layout.links.forEach(function (lk) {
+        var p = svgEl("path", { d: mapEdgePath(lk.points), class: "map-edge" });
+        gEdges.appendChild(p);
+        edgeEls.push({ el: p, a: lk.a, b: lk.b });
+      });
+
+      nodes.forEach(function (n) {
+        var id = n.id;
+        var pos = layout.pos[id];
+        if (!pos) return;
+        var r = radiusFor(n);
+        var color = MAP_KIND_VAR[n.kind] || "var(--text-faint)";
+        var heat = heatColor(n);
+
+        var grp = svgEl("g", { class: "map-node", "data-id": id, "data-kind": n.kind });
+        grp.style.color = heat;
+        grp.appendChild(svgEl("circle", { class: "ring", cx: pos.x, cy: pos.y, r: r, stroke: heat }));
+
+        var gl = svgEl("text", {
+          class: "glyph",
+          x: pos.x,
+          y: pos.y + 0.5,
+          "text-anchor": "middle",
+          "dominant-baseline": "central",
+          fill: color,
+        });
+        gl.textContent = MAP_KIND_GLYPH[n.kind] || "●";
+        grp.appendChild(gl);
+
+        var lb = svgEl("text", { class: "label", x: pos.x + r + 6, y: pos.y - 3, "text-anchor": "start" });
+        lb.textContent = n.label || n.id;
+        grp.appendChild(lb);
+
+        var sb = svgEl("text", { class: "sub", x: pos.x + r + 6, y: pos.y + 8, "text-anchor": "start" });
+        sb.textContent = "◂" + ((n.metrics && n.metrics.dependents) || 0) + " ▸" + ((n.metrics && n.metrics.imports) || 0);
+        grp.appendChild(sb);
+
+        gNodes.appendChild(grp);
+        nodeEls[id] = grp;
+
+        grp.addEventListener("mouseenter", function () {
+          showCard(n);
+          highlightNeighbours(id);
+        });
+        grp.addEventListener("mousemove", moveCard);
+        grp.addEventListener("mouseleave", function () {
+          hideCard();
+          // Returning to the focused node's view, not a blank slate: if a
+          // node is focused, re-assert its neighbourhood highlight;
+          // otherwise fall back to the filter state.
+          if (focused) highlightNeighbours(focused);
+          else clearHighlight();
+        });
+        grp.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          if (focused === id) {
+            focused = null;
+            clearHighlight();
+            closePanel();
+          } else {
+            focused = id;
+            highlightNeighbours(id);
+            openPanel(n);
+          }
+        });
+      });
+
+      applyFilters();
+    }
+
+    svg.addEventListener("click", function () {
+      // A pan ends with a background click; don't let it dismiss the panel.
+      if (dragMoved) {
+        dragMoved = false;
+        return;
+      }
+      focused = null;
+      clearHighlight();
+      closePanel();
+    });
+
+    function neighbours(id) {
+      var s = Object.create(null);
+      s[id] = true;
+      edges.forEach(function (e) {
+        if (e.from === id) s[e.to] = true;
+        if (e.to === id) s[e.from] = true;
+      });
+      return s;
+    }
+    // nodeVisible reports whether a node passes the current kind-chip +
+    // search filters. Highlighting respects this so focusing a node never
+    // un-dims something the user has filtered out.
+    function nodeVisible(n, q) {
+      return activeKinds[n.kind] && (!q || n.id.toLowerCase().indexOf(q) >= 0);
+    }
+    function currentQuery() {
+      return search.value.toLowerCase().trim();
+    }
+    function highlightNeighbours(id) {
+      var nb = neighbours(id);
+      var q = currentQuery();
+      nodes.forEach(function (n) {
+        var g = nodeEls[n.id];
+        if (!g) return;
+        // Lit only if it's a neighbour AND passes the filters; a
+        // filtered-out neighbour stays dim.
+        var lit = !!nb[n.id] && nodeVisible(n, q);
+        g.classList.toggle("map-lit", lit);
+        g.classList.toggle("map-dim", !lit);
+      });
+      edgeEls.forEach(function (x) {
+        var na = byId[x.a],
+          nb2 = byId[x.b];
+        var touches = x.a === id || x.b === id;
+        var on = touches && na && nb2 && nodeVisible(na, q) && nodeVisible(nb2, q);
+        x.el.classList.toggle("map-dim", !on);
+        x.el.classList.toggle("flow", on);
+      });
+    }
+    function clearHighlight() {
+      nodes.forEach(function (n) {
+        var g = nodeEls[n.id];
+        if (g) g.classList.remove("map-dim", "map-lit");
+      });
+      edgeEls.forEach(function (x) {
+        x.el.classList.remove("map-dim", "flow");
+      });
+      applyFilters();
+    }
+
+    // applyFilters dims nodes/edges that fail the kind-chip + search
+    // filters. It stays live even while a node is focused: when focused, it
+    // re-asserts the neighbourhood highlight (which itself respects the
+    // filters) so chips/search keep working during focus.
+    function applyFilters() {
+      if (focused) {
+        highlightNeighbours(focused);
+        return;
+      }
+      var q = currentQuery();
+      nodes.forEach(function (n) {
+        var g = nodeEls[n.id];
+        if (!g) return;
+        g.classList.toggle("map-dim", !nodeVisible(n, q));
+      });
+      edgeEls.forEach(function (x) {
+        var na = byId[x.a],
+          nbNode = byId[x.b];
+        var visEdge = na && nbNode && nodeVisible(na, q) && nodeVisible(nbNode, q);
+        x.el.classList.toggle("map-dim", !visEdge);
+      });
+    }
+    search.addEventListener("input", applyFilters);
+
+    // ---- hover metric card ----
+    function showCard(n) {
+      card.innerHTML = "";
+      var hd = document.createElement("div");
+      hd.className = "hd";
+      var dot = document.createElement("span");
+      dot.className = "tdot";
+      dot.style.background = MAP_KIND_VAR[n.kind] || "var(--text-faint)";
+      var b = document.createElement("b");
+      b.textContent = n.id;
+      var em = document.createElement("em");
+      em.textContent = MAP_KIND_NAME[n.kind] || n.kind;
+      hd.appendChild(dot);
+      hd.appendChild(b);
+      hd.appendChild(em);
+
+      var metrics = document.createElement("div");
+      metrics.className = "metrics";
+      [
+        ["Dependents", (n.metrics && n.metrics.dependents) || 0],
+        ["Imports", (n.metrics && n.metrics.imports) || 0],
+        ["Churn", (n.metrics && n.metrics.churn) || 0],
+      ].forEach(function (pair) {
+        var cell = document.createElement("div");
+        var k = document.createElement("div");
+        k.className = "k";
+        k.textContent = pair[0];
+        var v = document.createElement("div");
+        v.className = "v";
+        v.textContent = String(pair[1]);
+        cell.appendChild(k);
+        cell.appendChild(v);
+        metrics.appendChild(cell);
+      });
+
+      var foot = document.createElement("div");
+      foot.className = "foot";
+      var hc = document.createElement("span");
+      hc.className = "hc";
+      hc.style.background = heatColor(n);
+      var frac = colorFrac(n);
+      var footText = document.createElement("span");
+      // Described relative to the graph's own max for the colorBy metric.
+      var level = frac >= 0.66 ? "High" : frac >= 0.33 ? "Moderate" : "Low";
+      footText.textContent = level + " " + mapMetricLabel(colorByKey);
+      foot.appendChild(hc);
+      foot.appendChild(footText);
+
+      card.appendChild(hd);
+      card.appendChild(metrics);
+      card.appendChild(foot);
+      card.classList.add("show");
+    }
+    function moveCard(ev) {
+      var b = stage.getBoundingClientRect();
+      var x = ev.clientX - b.left + 16,
+        y = ev.clientY - b.top + 14;
+      if (x + 220 > b.width) x = ev.clientX - b.left - 220;
+      if (y + 140 > b.height) y = b.height - 146;
+      card.style.left = x + "px";
+      card.style.top = y + "px";
+    }
+    function hideCard() {
+      card.classList.remove("show");
+    }
+
+    // ---- detail side panel ----
+    function metricCell(label, value) {
+      var cell = document.createElement("div");
+      cell.className = "cell";
+      var k = document.createElement("div");
+      k.className = "k";
+      k.textContent = label;
+      var v = document.createElement("div");
+      v.className = "v";
+      v.textContent = String(value);
+      cell.appendChild(k);
+      cell.appendChild(v);
+      return cell;
+    }
+
+    function openPanel(n) {
+      panelInner.innerHTML = "";
+      var loc = n.location || {};
+      var desc = n.description || { text: "", source: "none" };
+
+      var ph = document.createElement("div");
+      ph.className = "map-ph";
+      var dot = document.createElement("span");
+      dot.className = "tdot";
+      dot.style.background = MAP_KIND_VAR[n.kind] || "var(--text-faint)";
+      var tt = document.createElement("div");
+      tt.className = "tt";
+      var ttB = document.createElement("b");
+      ttB.textContent = n.id;
+      var ttSpan = document.createElement("span");
+      ttSpan.textContent = MAP_KIND_NAME[n.kind] || n.kind;
+      tt.appendChild(ttB);
+      tt.appendChild(ttSpan);
+      var closeBtn = document.createElement("button");
+      closeBtn.type = "button";
+      closeBtn.className = "close-btn";
+      closeBtn.title = "Close";
+      closeBtn.textContent = "×";
+      closeBtn.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        focused = null;
+        clearHighlight();
+        closePanel();
+      });
+      ph.appendChild(dot);
+      ph.appendChild(tt);
+      ph.appendChild(closeBtn);
+
+      var pb = document.createElement("div");
+      pb.className = "map-pb";
+
+      // Address
+      var addrSec = document.createElement("div");
+      addrSec.className = "map-psec";
+      var addrH = document.createElement("h5");
+      addrH.textContent = "Address";
+      var addr = document.createElement("div");
+      addr.className = "map-addr";
+      var addrPath = document.createTextNode(loc.path || n.id);
+      addr.appendChild(addrPath);
+      if (loc.primaryFile) {
+        addr.appendChild(document.createElement("br"));
+        var pf = document.createElement("small");
+        pf.textContent = loc.primaryFile + (loc.files ? " · " + loc.files + " files" : "");
+        addr.appendChild(pf);
+      } else if (loc.files) {
+        addr.appendChild(document.createElement("br"));
+        var fc = document.createElement("small");
+        fc.textContent = loc.files + " files";
+        addr.appendChild(fc);
+      }
+      addrSec.appendChild(addrH);
+      addrSec.appendChild(addr);
+      pb.appendChild(addrSec);
+
+      // Description
+      var descSec = document.createElement("div");
+      descSec.className = "map-psec";
+      var descH = document.createElement("h5");
+      descH.textContent = "Description";
+      descSec.appendChild(descH);
+      if (desc.source && desc.source !== "none" && desc.text) {
+        var tag = document.createElement("span");
+        tag.className = "map-tag";
+        tag.textContent = desc.source === "observer-annotation" ? "from observer" : "from " + desc.source;
+        var body = document.createElement("div");
+        body.className = "map-desc";
+        body.textContent = desc.text;
+        descSec.appendChild(tag);
+        descSec.appendChild(body);
+      } else {
+        var emptyDoc = document.createElement("div");
+        emptyDoc.className = "map-empty-doc";
+        emptyDoc.textContent =
+          "No description in the code yet. Observer can ask your AI assistant to write a short, structured summary and store it beside the code — so this panel (and search) understand what this package does.";
+        var genBtn = document.createElement("button");
+        genBtn.type = "button";
+        genBtn.className = "map-gen-btn";
+        genBtn.textContent = "✦ Generate with Observer AI";
+        genBtn.title = "Coming soon — the //observer:summary annotation + AI generator skill is a fast follow (design spec §3, non-goals).";
+        genBtn.disabled = true;
+        descSec.appendChild(emptyDoc);
+        descSec.appendChild(genBtn);
+      }
+      pb.appendChild(descSec);
+
+      // Metrics
+      var metSec = document.createElement("div");
+      metSec.className = "map-psec";
+      var metH = document.createElement("h5");
+      metH.textContent = "Metrics";
+      var mrow = document.createElement("div");
+      mrow.className = "map-mrow";
+      var m = n.metrics || {};
+      mrow.appendChild(metricCell("Dependents", m.dependents || 0));
+      mrow.appendChild(metricCell("Imports", m.imports || 0));
+      mrow.appendChild(metricCell("Churn", m.churn || 0));
+      metSec.appendChild(metH);
+      metSec.appendChild(mrow);
+      pb.appendChild(metSec);
+
+      // Linked work
+      var linkSec = document.createElement("div");
+      linkSec.className = "map-psec map-links";
+      var linkH = document.createElement("h5");
+      linkH.textContent = "Linked work";
+      linkSec.appendChild(linkH);
+      var links = Array.isArray(n.links) ? n.links : [];
+      if (links.length === 0) {
+        var noLinks = document.createElement("div");
+        noLinks.className = "map-empty-doc";
+        noLinks.textContent = "No linked work yet.";
+        linkSec.appendChild(noLinks);
+      } else {
+        links.forEach(function (l) {
+          var lk = document.createElement("div");
+          lk.className = "lk";
+          var ic = document.createElement("span");
+          ic.className = "ic";
+          ic.textContent = l.type === "jira" ? "JR" : "SP";
+          var label = document.createElement("span");
+          label.textContent = (l.type === "jira" ? "Jira issue " : "ServicePlus task ") + (l.id || "");
+          var em = document.createElement("em");
+          em.textContent = "connect later";
+          lk.appendChild(ic);
+          lk.appendChild(label);
+          lk.appendChild(em);
+          linkSec.appendChild(lk);
+        });
+      }
+      pb.appendChild(linkSec);
+
+      panelInner.appendChild(ph);
+      panelInner.appendChild(pb);
+      panel.classList.add("open");
+    }
+    function closePanel() {
+      panel.classList.remove("open");
+    }
+
+    // ---- pan / zoom-to-cursor ----
+    function setViewBox() {
+      svg.setAttribute("viewBox", vb.x + " " + vb.y + " " + vb.w + " " + vb.h);
+    }
+    stage.addEventListener(
+      "wheel",
+      function (ev) {
+        ev.preventDefault();
+        var b = svg.getBoundingClientRect();
+        if (b.width === 0 || b.height === 0) return;
+        var mx = vb.x + ((ev.clientX - b.left) / b.width) * vb.w;
+        var my = vb.y + ((ev.clientY - b.top) / b.height) * vb.h;
+        var f = ev.deltaY < 0 ? 0.88 : 1.14;
+        // Clamp the zoom so the viewBox can neither collapse toward 0 (NaN /
+        // divide-by-zero on the next wheel) nor explode far past the graph.
+        var minW = baseW * 0.15,
+          maxW = baseW * 6;
+        var nw = vb.w * f;
+        if (nw < minW) f = minW / vb.w;
+        else if (nw > maxW) f = maxW / vb.w;
+        nw = vb.w * f;
+        var nh = vb.h * f;
+        vb.x = mx - (mx - vb.x) * (nw / vb.w);
+        vb.y = my - (my - vb.y) * (nh / vb.h);
+        vb.w = nw;
+        vb.h = nh;
+        setViewBox();
+      },
+      { passive: false }
+    );
+    var dragging = false,
+      lastX = 0,
+      lastY = 0,
+      downX = 0,
+      downY = 0;
+    stage.addEventListener("pointerdown", function (ev) {
+      dragging = true;
+      lastX = downX = ev.clientX;
+      lastY = downY = ev.clientY;
+      dragMoved = false;
+      stage.classList.add("grabbing");
+    });
+    stage.addEventListener("pointermove", function (ev) {
+      if (!dragging) return;
+      if (Math.abs(ev.clientX - downX) > 4 || Math.abs(ev.clientY - downY) > 4) dragMoved = true;
+      var b = svg.getBoundingClientRect();
+      if (b.width === 0 || b.height === 0) return;
+      vb.x -= ((ev.clientX - lastX) / b.width) * vb.w;
+      vb.y -= ((ev.clientY - lastY) / b.height) * vb.h;
+      lastX = ev.clientX;
+      lastY = ev.clientY;
+      setViewBox();
+    });
+    function stopDrag() {
+      dragging = false;
+      stage.classList.remove("grabbing");
+    }
+    stage.addEventListener("pointerup", stopDrag);
+    stage.addEventListener("pointerleave", stopDrag);
+
+    // ---- layout toggles (direction + hierarchical ⇄ force) ----
+    function refreshLayoutButtons() {
+      btnLR.classList.toggle("on", layoutMode === "hierarchical" && curDir === "LR");
+      btnTB.classList.toggle("on", layoutMode === "hierarchical" && curDir === "TB");
+      btnHier.classList.toggle("on", layoutMode === "hierarchical");
+      btnForce.classList.toggle("on", layoutMode === "force");
+      // Direction only applies to the hierarchical layout.
+      var dirN = layoutMode === "hierarchical";
+      btnLR.disabled = !dirN;
+      btnTB.disabled = !dirN;
+    }
+    function redraw() {
+      focused = null;
+      closePanel();
+      draw();
+      refreshLayoutButtons();
+    }
+    btnLR.addEventListener("click", function () {
+      layoutMode = "hierarchical";
+      curDir = "LR";
+      redraw();
+    });
+    btnTB.addEventListener("click", function () {
+      layoutMode = "hierarchical";
+      curDir = "TB";
+      redraw();
+    });
+    btnHier.addEventListener("click", function () {
+      layoutMode = "hierarchical";
+      redraw();
+    });
+    btnForce.addEventListener("click", function () {
+      if (!forceAvailable) return;
+      layoutMode = "force";
+      redraw();
+    });
+
+    refreshLayoutButtons();
+    draw();
   }
 
   function renderTable(text) {

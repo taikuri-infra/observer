@@ -72,6 +72,7 @@ func DefaultTabs(repo string) ([]manifest.Tab, error) {
 	tabs = append(tabs, databaseTabs(migrationsDirs)...)
 	tabs = append(tabs, goDepsTabs(goModules)...)
 	tabs = append(tabs, goCallGraphTabs(goModules)...)
+	tabs = append(tabs, serviceMapTabs(goModules)...)
 	tabs = append(tabs, frontendDepsTabs(repo, frontendModules)...)
 	tabs = append(tabs, hotspotsTab())
 
@@ -174,6 +175,25 @@ func goCallGraphTabs(goModules []string) []manifest.Tab {
 			Dir:      mod,
 			Renderer: "svg",
 			Requires: []string{"go-callvis"},
+		})
+	}
+	return tabs
+}
+
+// serviceMapTabs is native (observer gen graphmodel) — one per detected Go
+// module. Unlike goDepsTabs, no Dir is set: graphmodel needs the true repo
+// root (to anchor obs-data/hotspots.json and each node's location.path),
+// so the command runs from the repo root and passes --dir itself.
+func serviceMapTabs(goModules []string) []manifest.Tab {
+	var tabs []manifest.Tab
+	for _, mod := range goModules {
+		out := outputName("map.json", mod, len(goModules))
+		tabs = append(tabs, manifest.Tab{
+			Name:     tabName("Service map", mod, len(goModules)),
+			Kind:     manifest.KindGenerator,
+			Command:  fmt.Sprintf("observer gen graphmodel --dir '%s' --out 'obs-data/%s'", mod, out),
+			Output:   out,
+			Renderer: "map",
 		})
 	}
 	return tabs

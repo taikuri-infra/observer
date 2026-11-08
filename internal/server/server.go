@@ -366,7 +366,7 @@ func contentTypeFor(renderer string) string {
 		return "image/svg+xml"
 	case "markdown":
 		return "text/markdown; charset=utf-8"
-	case "json", "table":
+	case "json", "table", "map":
 		return "application/json"
 	default:
 		return "text/plain; charset=utf-8"

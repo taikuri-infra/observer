@@ -78,6 +78,20 @@ func TestDefaultTabsFixture(t *testing.T) {
 		t.Fatalf("default go-callvis command must omit -focus (R13): %q", callGraph.Command)
 	}
 
+	svcMap, ok := findTabByName(tabs, "Service map")
+	if !ok {
+		t.Fatalf("missing Service map tab: %+v", tabs)
+	}
+	if svcMap.Renderer != "map" || svcMap.Kind != manifest.KindGenerator {
+		t.Fatalf("Service map tab wrong: %+v", svcMap)
+	}
+	if svcMap.Dir != "" {
+		t.Fatalf("Service map tab must run from the repo root (no Dir), got %q", svcMap.Dir)
+	}
+	if !strings.Contains(svcMap.Command, "--dir 'services/api'") || !strings.Contains(svcMap.Command, "obs-data/map.json") {
+		t.Fatalf("Service map command wrong: %q", svcMap.Command)
+	}
+
 	db, ok := findTabByName(tabs, "Database")
 	if !ok {
 		t.Fatalf("missing Database tab: %+v", tabs)

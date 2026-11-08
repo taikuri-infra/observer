@@ -65,6 +65,7 @@ Usage:
   observer gen changes --base main --out <path> [--repo .]
   observer gen er --migrations <dir> --out <er.mmd> --dbml-out <er.dbml> [--repo .]
   observer gen godeps --dir <moduleDir> --out <godeps.dot> [--repo .]
+  observer gen graphmodel --dir <moduleDir> --out <graph.json> [--repo .]
   observer gen hotspots --out <hotspots.json> [--repo .] [--since <ref>]
   observer gen overview --out <index.md> [--repo .] [--base main]
   observer init [--repo .] [--out <path>]
@@ -130,12 +131,14 @@ func runGen(args []string) error {
 		return runGenER(args[1:])
 	case "godeps":
 		return runGenGoDeps(args[1:])
+	case "graphmodel":
+		return runGenGraphModel(args[1:])
 	case "hotspots":
 		return runGenHotspots(args[1:])
 	case "overview":
 		return runGenOverview(args[1:])
 	default:
-		return fmt.Errorf("gen: unknown generator %q (available: changes, er, godeps, hotspots, overview)", args[0])
+		return fmt.Errorf("gen: unknown generator %q (available: changes, er, godeps, graphmodel, hotspots, overview)", args[0])
 	}
 }
 
@@ -222,6 +225,42 @@ func runGenGoDeps(args []string) error {
 		return fmt.Errorf("gen godeps: %w", err)
 	}
 	return writeOut(absRepo, *out, dot)
+}
+
+// runGenGraphModel wires gen.GraphModel: --dir is the Go module directory
+// (relative to --repo unless absolute), --out is where the normalized
+// graph.json is written. Unlike gen godeps, --repo matters here beyond
+// resolving --dir: it anchors obs-data/hotspots.json and every node's
+// location.path, so it must be the true repo root even when --dir points
+// deep into a nested module.
+func runGenGraphModel(args []string) error {
+	fs := flag.NewFlagSet("gen graphmodel", flag.ExitOnError)
+	repo := fs.String("repo", ".", "path to the repo")
+	dir := fs.String("dir", ".", "path to the Go module directory (relative to --repo unless absolute)")
+	out := fs.String("out", "", "output file path (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("gen graphmodel: --out is required")
+	}
+	absRepo, err := absPath(*repo)
+	if err != nil {
+		return err
+	}
+	absDir := *dir
+	if !filepath.IsAbs(absDir) {
+		absDir = filepath.Join(absRepo, absDir)
+	}
+	g, err := gen.GraphModel(absRepo, absDir)
+	if err != nil {
+		return fmt.Errorf("gen graphmodel: %w", err)
+	}
+	b, err := json.MarshalIndent(g, "", "  ")
+	if err != nil {
+		return fmt.Errorf("gen graphmodel: marshal: %w", err)
+	}
+	return writeOut(absRepo, *out, string(b))
 }
 
 // runGenHotspots wires gen.Hotspots: aggregates git log --numstat churn per
