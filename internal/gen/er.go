@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 // erTable is one CREATE TABLE block.
@@ -31,9 +32,20 @@ type erRel struct {
 }
 
 var (
-	createTableRe = regexp.MustCompile(`(?is)CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*?)\n\);`)
+	// createTableRe tolerates an optional schema prefix on the table name
+	// (`public.users` -> captures "users", schema stripped) and a closing
+	// line that isn't exactly "\n);": indentation before the ")", and
+	// trailing table options after it (`) STRICT;`, `) PARTITION BY RANGE
+	// (created_at);`) are all accepted — the terminator is "a line whose
+	// first non-blank char is ')', up to the ';'".
+	createTableRe = regexp.MustCompile(`(?is)CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*?)\n[ \t]*\)[^;\n]*;`)
 	columnRe      = regexp.MustCompile(`^([a-zA-Z_][a-zA-Z0-9_]*)\s+([A-Za-z0-9_]+)`)
-	referencesRe  = regexp.MustCompile(`(?i)REFERENCES\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\))?`)
+	// referencesRe strips an optional schema prefix on the referenced table
+	// (`REFERENCES public.users(id)` -> parent "users", not "public").
+	referencesRe = regexp.MustCompile(`(?i)REFERENCES\s+(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\))?`)
+	// fkColRe pulls the (first) child column out of a table-level
+	// `FOREIGN KEY (a, b) REFERENCES ...` constraint line.
+	fkColRe = regexp.MustCompile(`(?i)FOREIGN\s+KEY\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)`)
 )
 
 // ER parses CREATE TABLE statements out of the *.sql files in migrationsDir
@@ -110,6 +122,16 @@ func parseSQL(sql string) ([]erTable, []erRel) {
 				}
 			}
 			if excluded {
+				// A table-level constraint line is never a column — but a
+				// FOREIGN KEY (...) REFERENCES ... line still declares an
+				// edge, so scan it for the reference before skipping.
+				if rm := referencesRe.FindStringSubmatch(line); rm != nil {
+					childCol := "fk"
+					if cm := fkColRe.FindStringSubmatch(line); cm != nil {
+						childCol = strings.ToLower(cm[1])
+					}
+					rels = append(rels, newRel(rm, name, childCol))
+				}
 				continue
 			}
 			cm := columnRe.FindStringSubmatch(line)
@@ -122,21 +144,108 @@ func parseSQL(sql string) ([]erTable, []erRel) {
 			fk := strings.Contains(upper, "REFERENCES")
 			cols = append(cols, erColumn{name: col, typ: typ, pk: pk, fk: fk})
 			if rm := referencesRe.FindStringSubmatch(line); rm != nil {
-				parentCol := rm[2]
-				if parentCol == "" {
-					parentCol = "id"
-				}
-				rels = append(rels, erRel{
-					parent:    strings.ToLower(rm[1]),
-					parentCol: strings.ToLower(parentCol),
-					child:     name,
-					col:       col,
-				})
+				rels = append(rels, newRel(rm, name, col))
 			}
 		}
 		tables = append(tables, erTable{name: name, columns: cols})
 	}
 	return tables, rels
+}
+
+// newRel builds an erRel from a referencesRe match (rm[1]=parent table with
+// any schema already stripped, rm[2]=parent column or "") for child.childCol.
+// A missing parent column defaults to "id", the overwhelmingly common PK.
+func newRel(rm []string, child, childCol string) erRel {
+	parentCol := rm[2]
+	if parentCol == "" {
+		parentCol = "id"
+	}
+	return erRel{
+		parent:    strings.ToLower(rm[1]),
+		parentCol: strings.ToLower(parentCol),
+		child:     child,
+		col:       childCol,
+	}
+}
+
+// ERGraphModel parses the same CREATE TABLE statements as ER (reusing
+// sqlUpFiles/parseSQL) and renders them as a normalized graph.json for the
+// canvas "map" renderer instead of mermaid/DBML text: one node per table
+// (kind "table", metrics columns/fkOut/fkIn) and one edge per foreign key,
+// from the child (the table holding the REFERENCES column) to the parent it
+// points at — matching the direction Go-deps edges use ("from" depends on
+// "to"). migrationsDir is read from directly (absolute or relative to the
+// caller's cwd); locationPath is what every node's location.path is set to
+// — normally the repo-relative migrations dir, passed separately since
+// ERGraphModel itself never sees the repo root (see cmd/observer's
+// runGenER, which resolves migrationsDir but keeps the original --migrations
+// value as locationPath).
+func ERGraphModel(migrationsDir, locationPath string) (*Graph, error) {
+	files, err := sqlUpFiles(migrationsDir)
+	if err != nil {
+		return nil, err
+	}
+	var sqlBuf strings.Builder
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", f, err)
+		}
+		sqlBuf.Write(b)
+		sqlBuf.WriteByte('\n')
+	}
+	tables, rels := parseSQL(sqlBuf.String())
+
+	if locationPath == "" {
+		locationPath = migrationsDir
+	}
+	locationPath = filepath.ToSlash(locationPath)
+
+	fkOut := map[string]int{}
+	fkIn := map[string]int{}
+	var edges []GraphEdge
+	for _, r := range rels {
+		fkOut[r.child]++
+		fkIn[r.parent]++
+		edges = append(edges, GraphEdge{From: r.child, To: r.parent, Weight: 1})
+	}
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].From != edges[j].From {
+			return edges[i].From < edges[j].From
+		}
+		return edges[i].To < edges[j].To
+	})
+
+	nodes := make([]GraphNode, 0, len(tables))
+	for _, t := range tables {
+		nodes = append(nodes, GraphNode{
+			ID:    t.name,
+			Label: t.name,
+			Kind:  "table",
+			Metrics: GraphMetrics{
+				Columns: len(t.columns),
+				FKOut:   fkOut[t.name],
+				FKIn:    fkIn[t.name],
+			},
+			Location:    GraphLocation{Path: locationPath, Files: len(files)},
+			Description: GraphDescription{Source: "none"},
+			Links:       []GraphLink{},
+		})
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+
+	return &Graph{
+		Meta: GraphMeta{
+			Source:        "db-er",
+			Module:        locationPath,
+			GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
+			SizeBy:        "fkIn",
+			ColorBy:       "columns",
+			DefaultLayout: "hierarchical",
+		},
+		Nodes: nodes,
+		Edges: edges,
+	}, nil
 }
 
 func renderMermaidER(tables []erTable, rels []erRel) string {

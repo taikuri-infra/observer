@@ -62,8 +62,11 @@ func usage() {
 
 Usage:
   observer serve [--repo .] [--base main] [--addr 127.0.0.1] [--port 7979]
+  observer gen callgraphmodel --dir <moduleDir> --main <mainPkgDir> --out <graph.json> [--repo .]
   observer gen changes --base main --out <path> [--repo .]
-  observer gen er --migrations <dir> --out <er.mmd> --dbml-out <er.dbml> [--repo .]
+  observer gen changedgraph --dir <moduleDir> --base main --out <graph.json> [--repo .]
+  observer gen er --migrations <dir> --out <er.mmd> --dbml-out <er.dbml> [--json-out <graph.json>] [--repo .]
+  observer gen frontendmodel --dir <pkgDir> --src <subdir> --out <graph.json> [--repo .]
   observer gen godeps --dir <moduleDir> --out <godeps.dot> [--repo .]
   observer gen graphmodel --dir <moduleDir> --out <graph.json> [--repo .]
   observer gen hotspots --out <hotspots.json> [--repo .] [--since <ref>]
@@ -125,10 +128,16 @@ func runGen(args []string) error {
 		return fmt.Errorf("gen: missing generator name (changes)")
 	}
 	switch args[0] {
+	case "callgraphmodel":
+		return runGenCallGraphModel(args[1:])
 	case "changes":
 		return runGenChanges(args[1:])
+	case "changedgraph":
+		return runGenChangedGraph(args[1:])
 	case "er":
 		return runGenER(args[1:])
+	case "frontendmodel":
+		return runGenFrontendModel(args[1:])
 	case "godeps":
 		return runGenGoDeps(args[1:])
 	case "graphmodel":
@@ -138,8 +147,51 @@ func runGen(args []string) error {
 	case "overview":
 		return runGenOverview(args[1:])
 	default:
-		return fmt.Errorf("gen: unknown generator %q (available: changes, er, godeps, graphmodel, hotspots, overview)", args[0])
+		return fmt.Errorf("gen: unknown generator %q (available: callgraphmodel, changes, changedgraph, er, frontendmodel, godeps, graphmodel, hotspots, overview)", args[0])
 	}
+}
+
+// runGenCallGraphModel wires gen.CallGraphModel: --dir is the Go module
+// directory (relative to --repo unless absolute, same resolution as gen
+// graphmodel/godeps), --main is a single main package's directory relative
+// to --dir (e.g. "cmd/server") — exactly one, since go-callvis itself
+// errors on a pattern matching more than one "package main" ("found
+// multiple packages with name: main"). --out is where the normalized
+// graph.json is written. Unlike gen graphmodel, --repo doesn't matter
+// beyond resolving --dir: a function's location.path is relative to its Go
+// module, not the repo (see ParseCallGraphDOT).
+func runGenCallGraphModel(args []string) error {
+	fs := flag.NewFlagSet("gen callgraphmodel", flag.ExitOnError)
+	repo := fs.String("repo", ".", "path to the repo")
+	dir := fs.String("dir", ".", "path to the Go module directory (relative to --repo unless absolute)")
+	mainPkg := fs.String("main", "", "the main package's directory, relative to --dir (e.g. cmd/server) (required)")
+	out := fs.String("out", "", "output file path (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *mainPkg == "" {
+		return fmt.Errorf("gen callgraphmodel: --main is required")
+	}
+	if *out == "" {
+		return fmt.Errorf("gen callgraphmodel: --out is required")
+	}
+	absRepo, err := absPath(*repo)
+	if err != nil {
+		return err
+	}
+	absDir := *dir
+	if !filepath.IsAbs(absDir) {
+		absDir = filepath.Join(absRepo, absDir)
+	}
+	g, err := gen.CallGraphModel(absDir, *mainPkg)
+	if err != nil {
+		return fmt.Errorf("gen callgraphmodel: %w", err)
+	}
+	b, err := json.MarshalIndent(g, "", "  ")
+	if err != nil {
+		return fmt.Errorf("gen callgraphmodel: marshal: %w", err)
+	}
+	return writeOut(absRepo, *out, string(b))
 }
 
 func runGenChanges(args []string) error {
@@ -165,13 +217,18 @@ func runGenChanges(args []string) error {
 }
 
 // runGenER is R2/R10: gen er takes --migrations plus two --out flags and
-// writes both files itself (mermaid erDiagram + DBML snapshot).
+// writes both files itself (mermaid erDiagram + DBML snapshot). When
+// --json-out is also given, it additionally writes the normalized
+// graph.json (gen.ERGraphModel) the Database tab's "map" renderer consumes
+// — one command, three artifacts, since all three are the same CREATE
+// TABLE parse.
 func runGenER(args []string) error {
 	fs := flag.NewFlagSet("gen er", flag.ExitOnError)
 	repo := fs.String("repo", ".", "path to the repo")
 	migrations := fs.String("migrations", "", "path to the SQL migrations directory (required)")
 	out := fs.String("out", "", "mermaid output file path (required)")
 	dbmlOut := fs.String("dbml-out", "", "DBML output file path (required)")
+	jsonOut := fs.String("json-out", "", "graph.json output file path (optional — also write the canvas map model)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -196,7 +253,95 @@ func runGenER(args []string) error {
 	if err := writeOut(absRepo, *out, mermaid); err != nil {
 		return err
 	}
-	return writeOut(absRepo, *dbmlOut, dbml)
+	if err := writeOut(absRepo, *dbmlOut, dbml); err != nil {
+		return err
+	}
+	if *jsonOut == "" {
+		return nil
+	}
+	g, err := gen.ERGraphModel(absMigrations, *migrations)
+	if err != nil {
+		return fmt.Errorf("gen er --json-out: %w", err)
+	}
+	b, err := json.MarshalIndent(g, "", "  ")
+	if err != nil {
+		return fmt.Errorf("gen er --json-out: marshal: %w", err)
+	}
+	return writeOut(absRepo, *jsonOut, string(b))
+}
+
+// runGenFrontendModel wires gen.FrontendGraphModel: --dir is the frontend
+// package directory (relative to --repo unless absolute), --src is the
+// subdirectory passed to depcruise (matching frontendDepsTabs' existing
+// "src" vs "." detection), --out is where the normalized graph.json is
+// written.
+func runGenFrontendModel(args []string) error {
+	fs := flag.NewFlagSet("gen frontendmodel", flag.ExitOnError)
+	repo := fs.String("repo", ".", "path to the repo")
+	dir := fs.String("dir", ".", "path to the frontend package directory (relative to --repo unless absolute)")
+	src := fs.String("src", "src", "subdirectory (relative to --dir) to scan with depcruise")
+	out := fs.String("out", "", "output file path (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("gen frontendmodel: --out is required")
+	}
+	absRepo, err := absPath(*repo)
+	if err != nil {
+		return err
+	}
+	absDir := *dir
+	if !filepath.IsAbs(absDir) {
+		absDir = filepath.Join(absRepo, absDir)
+	}
+	relDir, err := filepath.Rel(absRepo, absDir)
+	if err != nil {
+		return fmt.Errorf("gen frontendmodel: relativize %s against %s: %w", absDir, absRepo, err)
+	}
+	g, err := gen.FrontendGraphModel(absDir, relDir, *src)
+	if err != nil {
+		return fmt.Errorf("gen frontendmodel: %w", err)
+	}
+	b, err := json.MarshalIndent(g, "", "  ")
+	if err != nil {
+		return fmt.Errorf("gen frontendmodel: marshal: %w", err)
+	}
+	return writeOut(absRepo, *out, string(b))
+}
+
+// runGenChangedGraph wires gen.ChangedGraphModel: same --dir/--repo
+// resolution as gen graphmodel, plus --base for the comparison branch — the
+// "Changes" tab's highlighted service map.
+func runGenChangedGraph(args []string) error {
+	fs := flag.NewFlagSet("gen changedgraph", flag.ExitOnError)
+	repo := fs.String("repo", ".", "path to the repo")
+	dir := fs.String("dir", ".", "path to the Go module directory (relative to --repo unless absolute)")
+	base := fs.String("base", "main", "branch to compare against")
+	out := fs.String("out", "", "output file path (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("gen changedgraph: --out is required")
+	}
+	absRepo, err := absPath(*repo)
+	if err != nil {
+		return err
+	}
+	absDir := *dir
+	if !filepath.IsAbs(absDir) {
+		absDir = filepath.Join(absRepo, absDir)
+	}
+	g, err := gen.ChangedGraphModel(absRepo, absDir, *base)
+	if err != nil {
+		return fmt.Errorf("gen changedgraph: %w", err)
+	}
+	b, err := json.MarshalIndent(g, "", "  ")
+	if err != nil {
+		return fmt.Errorf("gen changedgraph: marshal: %w", err)
+	}
+	return writeOut(absRepo, *out, string(b))
 }
 
 // runGenGoDeps wires gen.GoDeps: --dir is the Go module directory (relative
