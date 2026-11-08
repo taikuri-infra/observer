@@ -267,19 +267,90 @@ html, body {
   text-align: left;
 }
 
-.render-graph,
-.render-mermaid,
-.render-svg {
+/* Mermaid keeps the simple scroll-to-overflow behaviour. */
+.render-mermaid {
   overflow: auto;
 }
-
-.render-graph svg,
-.render-mermaid svg,
-.render-svg svg {
+.render-mermaid svg {
   max-width: 100%;
   height: auto;
   background: #fff;
   border-radius: var(--radius);
+}
+
+/* Graphviz graphs (Go deps, Frontend deps, Go call graph) become an
+   interactive pan/zoom viewport — see mountInteractiveSVG in app.js. */
+.render-graph,
+.render-svg {
+  position: relative;
+  overflow: hidden;
+  height: 72vh;
+  min-height: 420px;
+  background: #fff;
+  border-radius: var(--radius);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+.render-graph.gv-grabbing,
+.render-svg.gv-grabbing {
+  cursor: grabbing;
+}
+.render-graph svg,
+.render-svg svg {
+  background: #fff;
+  /* width/height/position/transform are set inline by mountInteractiveSVG */
+}
+
+/* Focus: dim everything that isn't the clicked node's neighbourhood. */
+.render-graph svg .node,
+.render-graph svg .edge,
+.render-svg svg .node,
+.render-svg svg .edge {
+  transition: opacity 120ms ease;
+}
+.render-graph svg.gv-has-focus .gv-dim,
+.render-svg svg.gv-has-focus .gv-dim {
+  opacity: 0.1;
+}
+.render-graph svg .gv-root > polygon,
+.render-graph svg .gv-root > ellipse,
+.render-graph svg .gv-root > path,
+.render-svg svg .gv-root > polygon,
+.render-svg svg .gv-root > ellipse,
+.render-svg svg .gv-root > path {
+  stroke: var(--accent);
+  stroke-width: 2.5px;
+}
+
+/* Zoom / fit control cluster, pinned top-right of the viewport. */
+.gv-controls {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 5;
+}
+.gv-btn {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.gv-btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
 }
 
 .render-raw {
