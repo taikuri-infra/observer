@@ -347,11 +347,17 @@
   };
   var MAP_KIND_GLYPH = { entry: "⇄", service: "◆", adapter: "⌿", external: "◇" };
   var MAP_KIND_ORDER = ["entry", "service", "adapter", "external"];
-
-  function mapHeatColor(churn) {
-    if (churn >= 60) return "var(--map-hot)";
-    if (churn >= 25) return "var(--map-warm)";
-    return "var(--map-calm)";
+  // Human labels for the meta.sizeBy/colorBy metric keys (legend text).
+  // Unknown keys fall back to the raw key, so a future runtime metric
+  // (reqPerSec, latencyMs, …) still labels sensibly.
+  var MAP_METRIC_LABEL = {
+    dependents: "dependents (in-degree)",
+    imports: "imports (out-degree)",
+    churn: "churn",
+    loc: "lines of code",
+  };
+  function mapMetricLabel(key) {
+    return MAP_METRIC_LABEL[key] || key;
   }
 
   function svgEl(tag, attrs) {
@@ -396,19 +402,41 @@
       return;
     }
 
-    var byId = {};
-    var maxDependents = 1;
+    // Honor the meta seam: node size is driven by meta.sizeBy and ring
+    // color by meta.colorBy, so a future adapter emitting runtime metrics
+    // (reqPerSec/latencyMs/errorRate) reuses this renderer unchanged — only
+    // meta changes. Color is NORMALIZED to the graph's current max for the
+    // colorBy metric (not absolute churn thresholds), so any metric's range
+    // maps onto the calm→hot ramp.
+    var meta = data.meta || {};
+    var sizeByKey = meta.sizeBy || "dependents";
+    var colorByKey = meta.colorBy || "churn";
+
+    // Repo ids are attacker-influenced strings (a package literally named
+    // "__proto__" is legal); Object.create(null) keeps such a key from
+    // colliding with Object.prototype and corrupting lookups.
+    var byId = Object.create(null);
+    var maxSize = 1; // >=1 so radiusFor never divides by zero
+    var maxColor = 0; // 0 => every ring calm (no colorBy signal)
+    function metricVal(n, key) {
+      return n.metrics && typeof n.metrics[key] === "number" ? n.metrics[key] : 0;
+    }
     nodes.forEach(function (n) {
       byId[n.id] = n;
-      var dep = (n.metrics && n.metrics.dependents) || 0;
-      if (dep > maxDependents) maxDependents = dep;
+      var s = metricVal(n, sizeByKey);
+      if (s > maxSize) maxSize = s;
+      var c = metricVal(n, colorByKey);
+      if (c > maxColor) maxColor = c;
     });
     function radiusFor(n) {
-      var dep = (n.metrics && n.metrics.dependents) || 0;
-      return 9 + 17 * (dep / maxDependents);
+      return 9 + 17 * (metricVal(n, sizeByKey) / maxSize);
     }
-    function churnFor(n) {
-      return (n.metrics && n.metrics.churn) || 0;
+    function colorFrac(n) {
+      return maxColor > 0 ? metricVal(n, colorByKey) / maxColor : 0;
+    }
+    function heatColor(n) {
+      var f = colorFrac(n);
+      return f >= 0.66 ? "var(--map-hot)" : f >= 0.33 ? "var(--map-warm)" : "var(--map-calm)";
     }
 
     // ---- DOM scaffold ----
@@ -429,11 +457,11 @@
     searchWrap.appendChild(search);
     rail.appendChild(searchWrap);
 
-    var kindCounts = {};
+    var kindCounts = Object.create(null);
     nodes.forEach(function (n) {
       kindCounts[n.kind] = (kindCounts[n.kind] || 0) + 1;
     });
-    var activeKinds = {};
+    var activeKinds = Object.create(null);
     var kindWrap = document.createElement("div");
     var kindLabel = document.createElement("h4");
     kindLabel.textContent = "Kind";
@@ -470,7 +498,7 @@
 
     var sizeWrap = document.createElement("div");
     var sizeLabel = document.createElement("h4");
-    sizeLabel.textContent = "Node size — dependents";
+    sizeLabel.textContent = "Node size — " + mapMetricLabel(sizeByKey);
     var sizes = document.createElement("div");
     sizes.className = "map-legend";
     var sizesRow = document.createElement("div");
@@ -485,7 +513,7 @@
     sizesNote.style.fontSize = "11px";
     sizesNote.style.color = "var(--text-faint)";
     sizesNote.style.fontFamily = "var(--mono)";
-    sizesNote.textContent = "in-degree";
+    sizesNote.textContent = sizeByKey;
     sizesRow.appendChild(sizesNote);
     sizes.appendChild(sizesRow);
     sizeWrap.appendChild(sizeLabel);
@@ -494,7 +522,7 @@
 
     var heatWrap = document.createElement("div");
     var heatLabel = document.createElement("h4");
-    heatLabel.textContent = "Ring color — churn";
+    heatLabel.textContent = "Ring color — " + mapMetricLabel(colorByKey);
     var heatLegend = document.createElement("div");
     heatLegend.className = "map-legend";
     var heatbar = document.createElement("div");
@@ -533,14 +561,14 @@
     var btnHier = document.createElement("button");
     btnHier.type = "button";
     btnHier.textContent = "Hierarchical";
-    btnHier.className = "on";
-    btnHier.disabled = true; // the only implemented mode; kept visible+on for clarity
     var btnForce = document.createElement("button");
     btnForce.type = "button";
     btnForce.textContent = "Force";
-    btnForce.disabled = true;
-    btnForce.title =
-      "Force-directed layout is not implemented yet (design spec §6/§11 open question: d3-force vs. a compact custom sim) — TODO for a follow-up.";
+    if (!window.d3 || typeof window.d3.forceSimulation !== "function") {
+      // d3-force failed to load — keep hierarchical only rather than a dead toggle.
+      btnForce.disabled = true;
+      btnForce.title = "d3-force not available";
+    }
     modeSeg.appendChild(btnHier);
     modeSeg.appendChild(btnForce);
     layoutWrap.appendChild(layoutLabel);
@@ -560,7 +588,7 @@
     var hint = document.createElement("div");
     hint.className = "map-hint";
     hint.textContent =
-      "Real dagre layout · hover for metrics · click a node for its detail panel · scroll to zoom";
+      "Hover for metrics · click a node for its detail panel · drag to pan · scroll to zoom";
     var panel = document.createElement("aside");
     panel.className = "map-panel";
     var panelInner = document.createElement("div");
@@ -577,12 +605,22 @@
     setContent(root);
 
     // ---- layout + draw ----
-    var nodeEls = {};
+    var nodeEls = Object.create(null);
     var edgeEls = [];
     var focused = null;
     var vb = { x: 0, y: 0, w: 1000, h: 640 };
+    var baseW = 1000,
+      baseH = 640; // last layout's extent, for zoom clamping
+    // Start in the layout meta asks for (defaults to hierarchical). Force
+    // is only honored when d3-force actually loaded.
+    var forceAvailable = !!(window.d3 && typeof window.d3.forceSimulation === "function");
+    var layoutMode = meta.defaultLayout === "force" && forceAvailable ? "force" : "hierarchical";
+    var curDir = "LR";
+    var dragMoved = false; // set by a real pan; read by the svg background-click handler
 
-    function runLayout(rankdir) {
+    // hierarchicalLayout runs dagre and returns a renderer-neutral result:
+    // { width, height, pos: {id:{x,y}}, links: [{a,b,points:[…]}] }.
+    function hierarchicalLayout(rankdir) {
       var g = new window.dagre.graphlib.Graph();
       g.setGraph({ rankdir: rankdir, nodesep: 24, ranksep: 68, marginx: 36, marginy: 36 });
       g.setDefaultEdgeLabel(function () {
@@ -596,34 +634,122 @@
         if (byId[e.from] && byId[e.to]) g.setEdge(e.from, e.to);
       });
       window.dagre.layout(g);
-      return g;
+      var gg = g.graph();
+      var pos = Object.create(null);
+      g.nodes().forEach(function (id) {
+        var p = g.node(id);
+        if (p) pos[id] = { x: p.x, y: p.y };
+      });
+      var links = g.edges().map(function (e) {
+        return { a: e.v, b: e.w, points: g.edge(e).points };
+      });
+      return { width: gg.width || 1, height: gg.height || 1, pos: pos, links: links };
     }
 
-    function draw(rankdir) {
+    // forceLayout runs a d3-force simulation SYNCHRONOUSLY for a fixed tick
+    // budget then reads final positions — no continuous animation, no timer
+    // left running. Edges become straight lines between node centers. Same
+    // neutral result shape as hierarchicalLayout.
+    function forceLayout() {
+      var d3 = window.d3;
+      var simNodes = nodes.map(function (n) {
+        return { id: n.id, r: radiusFor(n) };
+      });
+      var idx = Object.create(null);
+      simNodes.forEach(function (sn) {
+        idx[sn.id] = sn;
+      });
+      var simLinks = [];
+      edges.forEach(function (e) {
+        if (idx[e.from] && idx[e.to]) simLinks.push({ source: e.from, target: e.to });
+      });
+      var sim = d3
+        .forceSimulation(simNodes)
+        .force(
+          "link",
+          d3
+            .forceLink(simLinks)
+            .id(function (d) {
+              return d.id;
+            })
+            .distance(96)
+            .strength(0.35)
+        )
+        .force("charge", d3.forceManyBody().strength(-280))
+        .force("center", d3.forceCenter(0, 0))
+        .force(
+          "collide",
+          d3.forceCollide().radius(function (d) {
+            return d.r + 10;
+          })
+        )
+        .stop();
+      for (var i = 0; i < 300; i++) sim.tick();
+
+      // Translate so the whole graph sits at a positive margin, and derive
+      // the viewBox extent.
+      var margin = 48;
+      var minX = Infinity,
+        minY = Infinity,
+        maxX = -Infinity,
+        maxY = -Infinity;
+      simNodes.forEach(function (sn) {
+        minX = Math.min(minX, sn.x - sn.r);
+        minY = Math.min(minY, sn.y - sn.r);
+        maxX = Math.max(maxX, sn.x + sn.r);
+        maxY = Math.max(maxY, sn.y + sn.r);
+      });
+      if (!isFinite(minX)) {
+        minX = minY = 0;
+        maxX = maxY = 1;
+      }
+      var pos = Object.create(null);
+      simNodes.forEach(function (sn) {
+        pos[sn.id] = { x: sn.x - minX + margin, y: sn.y - minY + margin };
+      });
+      var links = simLinks.map(function (l) {
+        var a = typeof l.source === "object" ? l.source.id : l.source;
+        var b = typeof l.target === "object" ? l.target.id : l.target;
+        return { a: a, b: b, points: [pos[a], pos[b]] };
+      });
+      return {
+        width: maxX - minX + 2 * margin,
+        height: maxY - minY + 2 * margin,
+        pos: pos,
+        links: links,
+      };
+    }
+
+    function computeLayout() {
+      if (layoutMode === "force" && forceAvailable) return forceLayout();
+      return hierarchicalLayout(curDir);
+    }
+
+    function draw() {
       gEdges.innerHTML = "";
       gNodes.innerHTML = "";
-      nodeEls = {};
+      nodeEls = Object.create(null);
       edgeEls = [];
 
-      var g = runLayout(rankdir);
-      var gg = g.graph();
-      vb = { x: 0, y: 0, w: gg.width || 1, h: gg.height || 1 };
+      var layout = computeLayout();
+      baseW = layout.width;
+      baseH = layout.height;
+      vb = { x: 0, y: 0, w: layout.width, h: layout.height };
       setViewBox();
 
-      g.edges().forEach(function (e) {
-        var pts = g.edge(e).points;
-        var p = svgEl("path", { d: mapEdgePath(pts), class: "map-edge" });
+      layout.links.forEach(function (lk) {
+        var p = svgEl("path", { d: mapEdgePath(lk.points), class: "map-edge" });
         gEdges.appendChild(p);
-        edgeEls.push({ el: p, a: e.v, b: e.w });
+        edgeEls.push({ el: p, a: lk.a, b: lk.b });
       });
 
-      g.nodes().forEach(function (id) {
-        var pos = g.node(id);
-        var n = byId[id];
-        if (!n || !pos) return;
+      nodes.forEach(function (n) {
+        var id = n.id;
+        var pos = layout.pos[id];
+        if (!pos) return;
         var r = radiusFor(n);
         var color = MAP_KIND_VAR[n.kind] || "var(--text-faint)";
-        var heat = mapHeatColor(churnFor(n));
+        var heat = heatColor(n);
 
         var grp = svgEl("g", { class: "map-node", "data-id": id, "data-kind": n.kind });
         grp.style.color = heat;
@@ -658,7 +784,11 @@
         grp.addEventListener("mousemove", moveCard);
         grp.addEventListener("mouseleave", function () {
           hideCard();
-          if (!focused) clearHighlight();
+          // Returning to the focused node's view, not a blank slate: if a
+          // node is focused, re-assert its neighbourhood highlight;
+          // otherwise fall back to the filter state.
+          if (focused) highlightNeighbours(focused);
+          else clearHighlight();
         });
         grp.addEventListener("click", function (ev) {
           ev.stopPropagation();
@@ -678,13 +808,18 @@
     }
 
     svg.addEventListener("click", function () {
+      // A pan ends with a background click; don't let it dismiss the panel.
+      if (dragMoved) {
+        dragMoved = false;
+        return;
+      }
       focused = null;
       clearHighlight();
       closePanel();
     });
 
     function neighbours(id) {
-      var s = {};
+      var s = Object.create(null);
       s[id] = true;
       edges.forEach(function (e) {
         if (e.from === id) s[e.to] = true;
@@ -692,16 +827,32 @@
       });
       return s;
     }
+    // nodeVisible reports whether a node passes the current kind-chip +
+    // search filters. Highlighting respects this so focusing a node never
+    // un-dims something the user has filtered out.
+    function nodeVisible(n, q) {
+      return activeKinds[n.kind] && (!q || n.id.toLowerCase().indexOf(q) >= 0);
+    }
+    function currentQuery() {
+      return search.value.toLowerCase().trim();
+    }
     function highlightNeighbours(id) {
       var nb = neighbours(id);
+      var q = currentQuery();
       nodes.forEach(function (n) {
         var g = nodeEls[n.id];
         if (!g) return;
-        g.classList.toggle("map-dim", !nb[n.id]);
-        g.classList.toggle("map-lit", !!nb[n.id]);
+        // Lit only if it's a neighbour AND passes the filters; a
+        // filtered-out neighbour stays dim.
+        var lit = !!nb[n.id] && nodeVisible(n, q);
+        g.classList.toggle("map-lit", lit);
+        g.classList.toggle("map-dim", !lit);
       });
       edgeEls.forEach(function (x) {
-        var on = x.a === id || x.b === id;
+        var na = byId[x.a],
+          nb2 = byId[x.b];
+        var touches = x.a === id || x.b === id;
+        var on = touches && na && nb2 && nodeVisible(na, q) && nodeVisible(nb2, q);
         x.el.classList.toggle("map-dim", !on);
         x.el.classList.toggle("flow", on);
       });
@@ -717,21 +868,26 @@
       applyFilters();
     }
 
+    // applyFilters dims nodes/edges that fail the kind-chip + search
+    // filters. It stays live even while a node is focused: when focused, it
+    // re-asserts the neighbourhood highlight (which itself respects the
+    // filters) so chips/search keep working during focus.
     function applyFilters() {
-      if (focused) return;
-      var q = search.value.toLowerCase().trim();
+      if (focused) {
+        highlightNeighbours(focused);
+        return;
+      }
+      var q = currentQuery();
       nodes.forEach(function (n) {
         var g = nodeEls[n.id];
         if (!g) return;
-        var vis = activeKinds[n.kind] && (!q || n.id.toLowerCase().indexOf(q) >= 0);
-        g.classList.toggle("map-dim", !vis);
+        g.classList.toggle("map-dim", !nodeVisible(n, q));
       });
       edgeEls.forEach(function (x) {
         var na = byId[x.a],
-          nb = byId[x.b];
-        var va = na && activeKinds[na.kind] && (!q || x.a.toLowerCase().indexOf(q) >= 0);
-        var vb = nb && activeKinds[nb.kind] && (!q || x.b.toLowerCase().indexOf(q) >= 0);
-        x.el.classList.toggle("map-dim", !(va && vb));
+          nbNode = byId[x.b];
+        var visEdge = na && nbNode && nodeVisible(na, q) && nodeVisible(nbNode, q);
+        x.el.classList.toggle("map-dim", !visEdge);
       });
     }
     search.addEventListener("input", applyFilters);
@@ -775,10 +931,12 @@
       foot.className = "foot";
       var hc = document.createElement("span");
       hc.className = "hc";
-      var churn = churnFor(n);
-      hc.style.background = mapHeatColor(churn);
+      hc.style.background = heatColor(n);
+      var frac = colorFrac(n);
       var footText = document.createElement("span");
-      footText.textContent = churn >= 60 ? "High change frequency — refactor risk" : churn >= 25 ? "Moderate change frequency" : "Stable";
+      // Described relative to the graph's own max for the colorBy metric.
+      var level = frac >= 0.66 ? "High" : frac >= 0.33 ? "Moderate" : "Low";
+      footText.textContent = level + " " + mapMetricLabel(colorByKey);
       foot.appendChild(hc);
       foot.appendChild(footText);
 
@@ -973,8 +1131,15 @@
         var mx = vb.x + ((ev.clientX - b.left) / b.width) * vb.w;
         var my = vb.y + ((ev.clientY - b.top) / b.height) * vb.h;
         var f = ev.deltaY < 0 ? 0.88 : 1.14;
-        var nw = vb.w * f,
-          nh = vb.h * f;
+        // Clamp the zoom so the viewBox can neither collapse toward 0 (NaN /
+        // divide-by-zero on the next wheel) nor explode far past the graph.
+        var minW = baseW * 0.15,
+          maxW = baseW * 6;
+        var nw = vb.w * f;
+        if (nw < minW) f = minW / vb.w;
+        else if (nw > maxW) f = maxW / vb.w;
+        nw = vb.w * f;
+        var nh = vb.h * f;
         vb.x = mx - (mx - vb.x) * (nw / vb.w);
         vb.y = my - (my - vb.y) * (nh / vb.h);
         vb.w = nw;
@@ -985,15 +1150,19 @@
     );
     var dragging = false,
       lastX = 0,
-      lastY = 0;
+      lastY = 0,
+      downX = 0,
+      downY = 0;
     stage.addEventListener("pointerdown", function (ev) {
       dragging = true;
-      lastX = ev.clientX;
-      lastY = ev.clientY;
+      lastX = downX = ev.clientX;
+      lastY = downY = ev.clientY;
+      dragMoved = false;
       stage.classList.add("grabbing");
     });
     stage.addEventListener("pointermove", function (ev) {
       if (!dragging) return;
+      if (Math.abs(ev.clientX - downX) > 4 || Math.abs(ev.clientY - downY) > 4) dragMoved = true;
       var b = svg.getBoundingClientRect();
       if (b.width === 0 || b.height === 0) return;
       vb.x -= ((ev.clientX - lastX) / b.width) * vb.w;
@@ -1009,25 +1178,45 @@
     stage.addEventListener("pointerup", stopDrag);
     stage.addEventListener("pointerleave", stopDrag);
 
-    // ---- direction toggle ----
-    var curDir = "LR";
-    function selectDir(dir, btn) {
-      btnLR.classList.remove("on");
-      btnTB.classList.remove("on");
-      btn.classList.add("on");
-      curDir = dir;
+    // ---- layout toggles (direction + hierarchical ⇄ force) ----
+    function refreshLayoutButtons() {
+      btnLR.classList.toggle("on", layoutMode === "hierarchical" && curDir === "LR");
+      btnTB.classList.toggle("on", layoutMode === "hierarchical" && curDir === "TB");
+      btnHier.classList.toggle("on", layoutMode === "hierarchical");
+      btnForce.classList.toggle("on", layoutMode === "force");
+      // Direction only applies to the hierarchical layout.
+      var dirN = layoutMode === "hierarchical";
+      btnLR.disabled = !dirN;
+      btnTB.disabled = !dirN;
+    }
+    function redraw() {
       focused = null;
       closePanel();
-      draw(curDir);
+      draw();
+      refreshLayoutButtons();
     }
     btnLR.addEventListener("click", function () {
-      selectDir("LR", btnLR);
+      layoutMode = "hierarchical";
+      curDir = "LR";
+      redraw();
     });
     btnTB.addEventListener("click", function () {
-      selectDir("TB", btnTB);
+      layoutMode = "hierarchical";
+      curDir = "TB";
+      redraw();
+    });
+    btnHier.addEventListener("click", function () {
+      layoutMode = "hierarchical";
+      redraw();
+    });
+    btnForce.addEventListener("click", function () {
+      if (!forceAvailable) return;
+      layoutMode = "force";
+      redraw();
     });
 
-    draw(curDir);
+    refreshLayoutButtons();
+    draw();
   }
 
   function renderTable(text) {
