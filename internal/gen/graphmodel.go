@@ -28,6 +28,12 @@ type GraphMeta struct {
 	SizeBy        string `json:"sizeBy"`
 	ColorBy       string `json:"colorBy"`
 	DefaultLayout string `json:"defaultLayout"`
+	// Base and AnyChanged are only set by ChangedGraphModel (the "Changes"
+	// tab's highlighted map): Base names the branch nodes were compared
+	// against, AnyChanged tells the renderer whether to dim non-changed
+	// nodes or fall back to a "no changes vs base" note.
+	Base       string `json:"base,omitempty"`
+	AnyChanged bool   `json:"anyChanged,omitempty"`
 }
 
 type GraphMetrics struct {
@@ -35,6 +41,12 @@ type GraphMetrics struct {
 	Imports    int `json:"imports"`
 	Churn      int `json:"churn"`
 	LOC        int `json:"loc"`
+	// Columns/FKOut/FKIn are only populated for "table" nodes (the database
+	// ER map, see er.go's ERGraphModel) — omitempty keeps them out of every
+	// other graph.json's nodes.
+	Columns int `json:"columns,omitempty"`
+	FKOut   int `json:"fkOut,omitempty"`
+	FKIn    int `json:"fkIn,omitempty"`
 }
 
 type GraphLocation struct {
@@ -62,6 +74,12 @@ type GraphNode struct {
 	Location    GraphLocation    `json:"location"`
 	Description GraphDescription `json:"description"`
 	Links       []GraphLink      `json:"links"`
+	// Changed/ChangedFiles are only populated by ChangedGraphModel: whether
+	// this package owns a file that differs vs the "Changes" tab's base
+	// branch, and which files those are (for the detail panel's "Changed
+	// files" section).
+	Changed      bool     `json:"changed,omitempty"`
+	ChangedFiles []string `json:"changedFiles,omitempty"`
 }
 
 type GraphEdge struct {

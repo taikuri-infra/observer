@@ -338,15 +338,26 @@
     service: "var(--map-service)",
     adapter: "var(--map-adapter)",
     external: "var(--map-external)",
+    table: "var(--map-table)",
+    module: "var(--map-module)",
   };
   var MAP_KIND_NAME = {
     entry: "Entry / HTTP",
     service: "Application",
     adapter: "Adapter / DB",
     external: "External",
+    table: "Table",
+    module: "Module",
   };
-  var MAP_KIND_GLYPH = { entry: "⇄", service: "◆", adapter: "⌿", external: "◇" };
-  var MAP_KIND_ORDER = ["entry", "service", "adapter", "external"];
+  var MAP_KIND_GLYPH = {
+    entry: "⇄",
+    service: "◆",
+    adapter: "⌿",
+    external: "◇",
+    table: "▦",
+    module: "▣",
+  };
+  var MAP_KIND_ORDER = ["entry", "service", "adapter", "external", "table", "module"];
   // Human labels for the meta.sizeBy/colorBy metric keys (legend text).
   // Unknown keys fall back to the raw key, so a future runtime metric
   // (reqPerSec, latencyMs, …) still labels sensibly.
@@ -396,6 +407,19 @@
     }
     var nodes = data.nodes;
     var edges = Array.isArray(data.edges) ? data.edges : [];
+
+    // "changes" mode (meta.source === "changes", from the Changes tab's
+    // gen.ChangedGraphModel): nodes carry a `changed` flag. When any node is
+    // changed, the default view lights those up and dims everything else;
+    // the detail panel also gains a "Changed files" section for them. With
+    // no changes, the map behaves exactly like a normal service map plus a
+    // one-line note.
+    var anyChanged = nodes.some(function (n) {
+      return !!n.changed;
+    });
+    function changedDim(n) {
+      return anyChanged && !n.changed;
+    }
 
     if (!window.dagre) {
       els.content.innerHTML = '<div class="error-banner">dagre.js not available</div>';
@@ -595,10 +619,46 @@
     panelInner.className = "map-panel-inner";
     panel.appendChild(panelInner);
 
+    var zoomRail = document.createElement("div");
+    zoomRail.className = "map-zoom";
+    function zoomBtn(label, title) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.textContent = label;
+      b.title = title;
+      return b;
+    }
+    var zoomInBtn = zoomBtn("+", "Zoom in");
+    var zoomOutBtn = zoomBtn("−", "Zoom out");
+    var zoomFitBtn = zoomBtn("⤢", "Fit to view");
+    zoomRail.appendChild(zoomInBtn);
+    zoomRail.appendChild(zoomOutBtn);
+    zoomRail.appendChild(zoomFitBtn);
+
     stage.appendChild(svg);
     stage.appendChild(card);
     stage.appendChild(hint);
+    stage.appendChild(zoomRail);
     stage.appendChild(panel);
+
+    // "Changes" mode banner: lit-changed-nodes summary, or a "no changes vs
+    // base" note when the branch has nothing to show.
+    if (meta.source === "changes") {
+      var banner = document.createElement("div");
+      banner.className = "map-changes-banner";
+      var baseName = meta.base || "base";
+      if (anyChanged) {
+        var changedCount = nodes.filter(function (n) {
+          return n.changed;
+        }).length;
+        banner.classList.add("has-changes");
+        banner.textContent =
+          changedCount + " package" + (changedCount === 1 ? "" : "s") + " changed vs " + baseName;
+      } else {
+        banner.textContent = "No changes vs " + baseName + " — showing the full package map.";
+      }
+      stage.appendChild(banner);
+    }
 
     root.appendChild(rail);
     root.appendChild(stage);
@@ -752,6 +812,7 @@
         var heat = heatColor(n);
 
         var grp = svgEl("g", { class: "map-node", "data-id": id, "data-kind": n.kind });
+        if (n.changed) grp.classList.add("map-changed");
         grp.style.color = heat;
         grp.appendChild(svgEl("circle", { class: "ring", cx: pos.x, cy: pos.y, r: r, stroke: heat }));
 
@@ -881,13 +942,14 @@
       nodes.forEach(function (n) {
         var g = nodeEls[n.id];
         if (!g) return;
-        g.classList.toggle("map-dim", !nodeVisible(n, q));
+        g.classList.toggle("map-dim", !nodeVisible(n, q) || changedDim(n));
       });
       edgeEls.forEach(function (x) {
         var na = byId[x.a],
           nbNode = byId[x.b];
         var visEdge = na && nbNode && nodeVisible(na, q) && nodeVisible(nbNode, q);
-        x.el.classList.toggle("map-dim", !visEdge);
+        var edgeChangedDim = anyChanged && !(na && na.changed) && !(nbNode && nbNode.changed);
+        x.el.classList.toggle("map-dim", !visEdge || edgeChangedDim);
       });
     }
     search.addEventListener("input", applyFilters);
@@ -1079,6 +1141,32 @@
       metSec.appendChild(mrow);
       pb.appendChild(metSec);
 
+      // Changed files (only for nodes flagged by gen.ChangedGraphModel)
+      if (n.changed) {
+        var chSec = document.createElement("div");
+        chSec.className = "map-psec";
+        var chFiles = Array.isArray(n.changedFiles) ? n.changedFiles : [];
+        var chH = document.createElement("h5");
+        chH.textContent = "Changed files (" + chFiles.length + ")";
+        chSec.appendChild(chH);
+        if (chFiles.length === 0) {
+          var chEmpty = document.createElement("div");
+          chEmpty.className = "map-empty-doc";
+          chEmpty.textContent = "Flagged as changed, but no files were listed.";
+          chSec.appendChild(chEmpty);
+        } else {
+          var chList = document.createElement("ul");
+          chList.className = "map-changed-files";
+          chFiles.forEach(function (f) {
+            var li = document.createElement("li");
+            li.textContent = f;
+            chList.appendChild(li);
+          });
+          chSec.appendChild(chList);
+        }
+        pb.appendChild(chSec);
+      }
+
       // Linked work
       var linkSec = document.createElement("div");
       linkSec.className = "map-psec map-links";
@@ -1122,6 +1210,40 @@
     function setViewBox() {
       svg.setAttribute("viewBox", vb.x + " " + vb.y + " " + vb.w + " " + vb.h);
     }
+
+    // zoomBy scales the viewBox about its own center (not the cursor — that's
+    // the wheel handler's job) by factor, clamped to the same [0.15, 6] *
+    // baseW/baseH range the wheel handler uses so the +/- buttons can never
+    // collapse or blow out the view. zoomFit resets to the last layout's
+    // full extent.
+    function zoomBy(factor) {
+      var cx = vb.x + vb.w / 2,
+        cy = vb.y + vb.h / 2;
+      var minW = baseW * 0.15,
+        maxW = baseW * 6;
+      var nw = vb.w * factor;
+      if (nw < minW) factor = minW / vb.w;
+      else if (nw > maxW) factor = maxW / vb.w;
+      nw = vb.w * factor;
+      var nh = vb.h * factor;
+      vb.x = cx - nw / 2;
+      vb.y = cy - nh / 2;
+      vb.w = nw;
+      vb.h = nh;
+      setViewBox();
+    }
+    function zoomFit() {
+      vb = { x: 0, y: 0, w: baseW, h: baseH };
+      setViewBox();
+    }
+    zoomInBtn.addEventListener("click", function () {
+      zoomBy(0.8);
+    });
+    zoomOutBtn.addEventListener("click", function () {
+      zoomBy(1.25);
+    });
+    zoomFitBtn.addEventListener("click", zoomFit);
+
     stage.addEventListener(
       "wheel",
       function (ev) {

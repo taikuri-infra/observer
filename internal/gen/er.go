@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 // erTable is one CREATE TABLE block.
@@ -137,6 +138,86 @@ func parseSQL(sql string) ([]erTable, []erRel) {
 		tables = append(tables, erTable{name: name, columns: cols})
 	}
 	return tables, rels
+}
+
+// ERGraphModel parses the same CREATE TABLE statements as ER (reusing
+// sqlUpFiles/parseSQL) and renders them as a normalized graph.json for the
+// canvas "map" renderer instead of mermaid/DBML text: one node per table
+// (kind "table", metrics columns/fkOut/fkIn) and one edge per foreign key,
+// from the child (the table holding the REFERENCES column) to the parent it
+// points at — matching the direction Go-deps edges use ("from" depends on
+// "to"). migrationsDir is read from directly (absolute or relative to the
+// caller's cwd); locationPath is what every node's location.path is set to
+// — normally the repo-relative migrations dir, passed separately since
+// ERGraphModel itself never sees the repo root (see cmd/observer's
+// runGenER, which resolves migrationsDir but keeps the original --migrations
+// value as locationPath).
+func ERGraphModel(migrationsDir, locationPath string) (*Graph, error) {
+	files, err := sqlUpFiles(migrationsDir)
+	if err != nil {
+		return nil, err
+	}
+	var sqlBuf strings.Builder
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", f, err)
+		}
+		sqlBuf.Write(b)
+		sqlBuf.WriteByte('\n')
+	}
+	tables, rels := parseSQL(sqlBuf.String())
+
+	if locationPath == "" {
+		locationPath = migrationsDir
+	}
+	locationPath = filepath.ToSlash(locationPath)
+
+	fkOut := map[string]int{}
+	fkIn := map[string]int{}
+	var edges []GraphEdge
+	for _, r := range rels {
+		fkOut[r.child]++
+		fkIn[r.parent]++
+		edges = append(edges, GraphEdge{From: r.child, To: r.parent, Weight: 1})
+	}
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].From != edges[j].From {
+			return edges[i].From < edges[j].From
+		}
+		return edges[i].To < edges[j].To
+	})
+
+	nodes := make([]GraphNode, 0, len(tables))
+	for _, t := range tables {
+		nodes = append(nodes, GraphNode{
+			ID:    t.name,
+			Label: t.name,
+			Kind:  "table",
+			Metrics: GraphMetrics{
+				Columns: len(t.columns),
+				FKOut:   fkOut[t.name],
+				FKIn:    fkIn[t.name],
+			},
+			Location:    GraphLocation{Path: locationPath, Files: len(files)},
+			Description: GraphDescription{Source: "none"},
+			Links:       []GraphLink{},
+		})
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+
+	return &Graph{
+		Meta: GraphMeta{
+			Source:        "db-er",
+			Module:        locationPath,
+			GeneratedAt:   time.Now().UTC().Format(time.RFC3339),
+			SizeBy:        "fkIn",
+			ColorBy:       "columns",
+			DefaultLayout: "hierarchical",
+		},
+		Nodes: nodes,
+		Edges: edges,
+	}, nil
 }
 
 func renderMermaidER(tables []erTable, rels []erRel) string {

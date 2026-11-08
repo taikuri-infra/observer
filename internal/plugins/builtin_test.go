@@ -55,16 +55,29 @@ func TestDefaultTabsFixture(t *testing.T) {
 	if _, ok := findTabByName(tabs, "Hotspots"); !ok {
 		t.Fatalf("missing Hotspots tab: %+v", tabs)
 	}
+	if _, ok := findTabByName(tabs, "Go deps"); ok {
+		t.Fatalf("Go deps tab must no longer be wired (Service map replaces it): %+v", tabs)
+	}
 
-	goDeps, ok := findTabByName(tabs, "Go deps")
+	if tabs[0].Name != "Overview" {
+		t.Fatalf("tabs[0] = %q, want Overview", tabs[0].Name)
+	}
+	if tabs[1].Name != "Service map" {
+		t.Fatalf("tabs[1] = %q, want Service map (2nd tab, right after Overview)", tabs[1].Name)
+	}
+	if tabs[2].Name != "Changes" {
+		t.Fatalf("tabs[2] = %q, want Changes (right after Service map)", tabs[2].Name)
+	}
+
+	changes, ok := findTabByName(tabs, "Changes")
 	if !ok {
-		t.Fatalf("missing Go deps tab: %+v", tabs)
+		t.Fatalf("missing Changes tab: %+v", tabs)
 	}
-	if goDeps.Dir != "services/api" {
-		t.Fatalf("Go deps Dir = %q, want services/api", goDeps.Dir)
+	if changes.Renderer != "map" {
+		t.Fatalf("Changes renderer = %q, want map (highlighted service map)", changes.Renderer)
 	}
-	if !strings.Contains(goDeps.Command, "../../obs-data/godeps.dot") {
-		t.Fatalf("Go deps command should write back up to top-level obs-data: %q", goDeps.Command)
+	if !strings.Contains(changes.Command, "observer gen changedgraph") || !strings.Contains(changes.Command, "--dir 'services/api'") {
+		t.Fatalf("Changes command wrong: %q", changes.Command)
 	}
 
 	callGraph, ok := findTabByName(tabs, "Go call graph")
@@ -99,13 +112,25 @@ func TestDefaultTabsFixture(t *testing.T) {
 	if !strings.Contains(db.Command, "services/api/internal/adapters/postgres/tenant_migrations") {
 		t.Fatalf("Database command missing detected migrations dir: %q", db.Command)
 	}
+	if db.Renderer != "map" {
+		t.Fatalf("Database renderer = %q, want map (canvas ER)", db.Renderer)
+	}
+	if !strings.Contains(db.Command, "--json-out") {
+		t.Fatalf("Database command missing --json-out: %q", db.Command)
+	}
 
 	fe, ok := findTabByName(tabs, "Frontend deps")
 	if !ok {
 		t.Fatalf("missing Frontend deps tab: %+v", tabs)
 	}
-	if fe.Dir != "apps/web" {
-		t.Fatalf("Frontend deps Dir = %q, want apps/web (tests/e2e must be excluded)", fe.Dir)
+	if fe.Dir != "" {
+		t.Fatalf("Frontend deps tab must run from the repo root (no Dir), got %q", fe.Dir)
+	}
+	if fe.Renderer != "map" {
+		t.Fatalf("Frontend deps renderer = %q, want map (canvas)", fe.Renderer)
+	}
+	if !strings.Contains(fe.Command, "--dir 'apps/web'") {
+		t.Fatalf("Frontend deps command missing --dir 'apps/web': %q", fe.Command)
 	}
 	if len(fe.Requires) == 0 || fe.Requires[0] != "depcruise" {
 		t.Fatalf("Frontend deps tab wrong requires: %+v", fe)
@@ -125,10 +150,10 @@ func TestDefaultTabsFixture(t *testing.T) {
 
 // TestDefaultTabsServicePlus is M3's acceptance check: run DefaultTabs
 // against the real servicePlus monorepo and assert it finds the Go module
-// at services/api (with Dir set correctly) and a Database tab backed by
-// the tenant_migrations dir (which has chat_channels et al). It must NOT
-// invoke any external tool — only inspect the filesystem and build command
-// strings.
+// at services/api (Service map + Go call graph tabs) and a canvas-rendered
+// Database tab backed by the tenant_migrations dir (which has chat_channels
+// et al). It must NOT invoke any external tool — only inspect the
+// filesystem and build command strings.
 func TestDefaultTabsServicePlus(t *testing.T) {
 	const repo = "/Users/babak/codes/DoTech/servicePlus"
 	if _, err := os.Stat(repo); err != nil {
@@ -140,12 +165,9 @@ func TestDefaultTabsServicePlus(t *testing.T) {
 		t.Fatalf("DefaultTabs: %v", err)
 	}
 
-	goDeps, ok := findTabByName(tabs, "Go deps")
-	if !ok {
-		t.Fatalf("missing Go deps tab for servicePlus: %+v", tabs)
-	}
-	if goDeps.Dir != "services/api" {
-		t.Fatalf("Go deps Dir = %q, want services/api", goDeps.Dir)
+	svcMap, ok := findTabByName(tabs, "Service map")
+	if !ok || svcMap.Renderer != "map" {
+		t.Fatalf("missing/incorrect Service map tab for servicePlus: %+v (ok=%v)", svcMap, ok)
 	}
 
 	callGraph, ok := findTabByName(tabs, "Go call graph")
@@ -166,8 +188,8 @@ func TestDefaultTabsServicePlus(t *testing.T) {
 	for _, tab := range dbTabs {
 		if strings.Contains(tab.Command, "tenant_migrations") {
 			foundTenantMigrations = true
-			if tab.Renderer != "mermaid" {
-				t.Fatalf("Database tab renderer = %q, want mermaid", tab.Renderer)
+			if tab.Renderer != "map" {
+				t.Fatalf("Database tab renderer = %q, want map", tab.Renderer)
 			}
 		}
 	}
