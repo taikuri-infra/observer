@@ -10,17 +10,24 @@ import (
 	"strings"
 )
 
-// PackageDocResult is what one package directory's doc comment yields:
-// the godoc text (source for description.text when no //observer:summary
-// exists), any //observer: annotation values found in that same comment
-// block, and which file it was extracted from (for location.primaryFile).
+// PackageDocResult is what one package directory's doc comments yield: the
+// godoc text (source for description.text when no //observer:summary
+// exists), any //observer: annotation values found across the package's
+// files, and which file the godoc text was extracted from (for
+// location.primaryFile).
 type PackageDocResult struct {
-	PrimaryFile string // base filename the doc/annotations came from (or, if none had a doc comment, the first non-test .go file — always set when goFiles is non-empty)
-	GodocText   string // package doc, "Package <name> " prefix stripped; "" if no godoc comment
+	PrimaryFile string // base filename the godoc came from (or, if no file had a doc comment, the first non-test .go file — always set when goFiles is non-empty)
+	GodocText   string // package doc, directives/banners/"Package <name> " prefix stripped; "" if no godoc comment
 	Summary     string // //observer:summary value; "" if absent
 	Owner       string // //observer:owner value; "" if absent
 	Task        string // //observer:task value; "" if absent
 }
+
+// generatedBannerRe matches the conventional "Code generated … DO NOT
+// EDIT." banner (comment markers already removed by CommentGroup.Text()).
+// Text() keeps it because it is prose, not a //tool:directive — so we strip
+// it ourselves to keep machine banners out of a node's description.
+var generatedBannerRe = regexp.MustCompile(`(?m)^[ \t]*Code generated .* DO NOT EDIT\.[ \t]*$`)
 
 // jiraIDRe matches a Jira-shaped work-item id: one or more uppercase
 // letters, a dash, and digits (e.g. "OBS-42"). "SP-…" is excluded (kept
@@ -40,25 +47,31 @@ func InferLinkType(task string) string {
 }
 
 // ExtractPackageDoc scans dir's non-test .go files (in sorted/deterministic
-// order) for the first one carrying a package doc comment — the `//` block
-// immediately above `package X`, which go/parser attaches to File.Doc only
-// when it directly precedes the package clause with no intervening blank
-// line — and parses both the plain godoc text and any //observer:<key>
-// <value> directive lines out of that same comment block.
+// order) and returns the package's description inputs:
 //
-// //observer: lines use Go's directive-comment convention (no space between
-// "//" and the key, e.g. "//observer:summary …"), so they never show up as
-// prose in the godoc text and godoc readers already skip them.
+//   - GodocText: the prose of the first file (sorted) carrying a package
+//     doc comment — the comment group immediately above `package X`, which
+//     go/parser attaches to File.Doc. We use CommentGroup.Text(), so block
+//     (`/* … */`) comments work and //tool:directive lines (//go:generate,
+//     //observer:…) plus a "Code generated … DO NOT EDIT." banner are
+//     stripped from the prose.
+//   - Summary/Owner/Task: //observer:<key> <value> directives, merged across
+//     ALL of the package's files (first file, in sorted order, to carry a
+//     given key wins). A package may legitimately keep its godoc in doc.go
+//     and its //observer:summary above `package` in another file; precedence
+//     (summary > godoc) must still hold across that split, so directives are
+//     never tied to the single file the godoc came from.
 func ExtractPackageDoc(dir string, goFiles []string) (PackageDocResult, error) {
 	names := filterNonTestGo(goFiles)
 	sort.Strings(names)
 
-	var fallback string
+	var res PackageDocResult
 	if len(names) > 0 {
-		fallback = names[0]
+		res.PrimaryFile = names[0] // fallback until a godoc'd file is found
 	}
 
 	fset := token.NewFileSet()
+	godocFound := false
 	for _, name := range names {
 		path := filepath.Join(dir, name)
 		f, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.PackageClauseOnly)
@@ -68,34 +81,36 @@ func ExtractPackageDoc(dir string, goFiles []string) (PackageDocResult, error) {
 		if f.Doc == nil || len(f.Doc.List) == 0 {
 			continue
 		}
-		res := parseDocComment(f.Doc.List, f.Name.Name)
-		res.PrimaryFile = name
-		return res, nil
+		// //observer: directives: merge across every file (first wins).
+		mergeAnnotations(f.Doc.List, &res)
+		// godoc prose: take the first file (sorted) that actually has some.
+		if !godocFound {
+			if text := cleanDoc(f.Doc.Text(), f.Name.Name); text != "" {
+				res.GodocText = text
+				res.PrimaryFile = name
+				godocFound = true
+			}
+		}
 	}
-	return PackageDocResult{PrimaryFile: fallback}, nil
+	return res, nil
 }
 
-// parseDocComment walks a package doc comment's raw lines, splitting them
-// into godoc prose and //observer: directive values, then returns the
-// prose joined into GodocText with the "Package <pkgName> " prefix (Go's
-// standard package-doc convention) stripped.
-func parseDocComment(list []*ast.Comment, pkgName string) PackageDocResult {
-	var res PackageDocResult
-	var docLines []string
+// mergeAnnotations pulls //observer:<key> <value> directives out of a doc
+// comment group's raw lines and stores them on res without overwriting a
+// value an earlier (sorted-earlier) file already set.
+func mergeAnnotations(list []*ast.Comment, res *PackageDocResult) {
 	for _, c := range list {
 		raw := strings.TrimPrefix(c.Text, "//")
-		if strings.HasPrefix(raw, "observer:") {
-			applyAnnotation(strings.TrimPrefix(raw, "observer:"), &res)
-			continue
+		if raw == c.Text || !strings.HasPrefix(raw, "observer:") {
+			continue // block comment, or not an //observer: directive
 		}
-		docLines = append(docLines, strings.TrimPrefix(raw, " "))
+		applyAnnotation(strings.TrimPrefix(raw, "observer:"), res)
 	}
-	res.GodocText = joinDocLines(docLines, pkgName)
-	return res
 }
 
 // applyAnnotation parses one //observer: line's "<key> <value>" body
-// (rest, with the "observer:" prefix already stripped) and stores it on res.
+// (rest, with the "observer:" prefix already stripped) and stores it on
+// res — first value wins, so a later file can't clobber an earlier one.
 func applyAnnotation(rest string, res *PackageDocResult) {
 	parts := strings.SplitN(strings.TrimSpace(rest), " ", 2)
 	if len(parts) == 0 || parts[0] == "" {
@@ -108,42 +123,33 @@ func applyAnnotation(rest string, res *PackageDocResult) {
 	}
 	switch key {
 	case "summary":
-		res.Summary = value
+		if res.Summary == "" {
+			res.Summary = value
+		}
 	case "owner":
-		res.Owner = value
+		if res.Owner == "" {
+			res.Owner = value
+		}
 	case "task":
-		res.Task = value
+		if res.Task == "" {
+			res.Task = value
+		}
 	}
 }
 
-// joinDocLines joins a package comment's prose lines into one string,
-// treating blank comment lines ("//") as paragraph breaks, then strips the
-// conventional "Package <pkgName> " prefix so description.text reads as a
-// sentence fragment (matching the style already used across this repo's
-// package comments, e.g. "implements the tenant provisioning pipeline…").
-func joinDocLines(lines []string, pkgName string) string {
-	var paras []string
-	var cur []string
-	flush := func() {
-		if len(cur) > 0 {
-			paras = append(paras, strings.Join(cur, " "))
-			cur = nil
-		}
-	}
-	for _, l := range lines {
-		if strings.TrimSpace(l) == "" {
-			flush()
-			continue
-		}
-		cur = append(cur, l)
-	}
-	flush()
-	text := strings.Join(paras, "\n\n")
+// cleanDoc normalizes CommentGroup.Text() output into a node description:
+// strips a leftover "Code generated … DO NOT EDIT." banner (Text() keeps it
+// since it's not a directive) and the conventional "Package <pkgName> "
+// prefix, so the text reads as a sentence fragment (matching the style used
+// across this repo, e.g. "implements the tenant provisioning pipeline…").
+func cleanDoc(text, pkgName string) string {
+	text = generatedBannerRe.ReplaceAllString(text, "")
+	text = strings.TrimSpace(text)
 	prefix := "Package " + pkgName + " "
 	if strings.HasPrefix(text, prefix) {
 		text = strings.TrimPrefix(text, prefix)
 	}
-	return text
+	return strings.TrimSpace(text)
 }
 
 // filterNonTestGo drops "_test.go" files — a package's doc comment is never

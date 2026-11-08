@@ -117,8 +117,8 @@ func GraphModel(repoDir, moduleDir string) (*Graph, error) {
 		if err := dec.Decode(&p); err != nil {
 			return nil, fmt.Errorf("decode go list output: %w", err)
 		}
-		if !strings.HasPrefix(p.ImportPath, modulePath) {
-			continue // stdlib or third-party: not a node in this module's own map
+		if !underModule(p.ImportPath, modulePath) {
+			continue // stdlib, third-party, or a sibling module: not a node here
 		}
 		id := trimModulePrefix(p.ImportPath, modulePath)
 		goFiles := make([]string, 0, len(p.GoFiles)+len(p.TestGoFiles)+len(p.XTestGoFiles))
@@ -154,7 +154,7 @@ func GraphModel(repoDir, moduleDir string) (*Graph, error) {
 	for _, id := range ids {
 		seen := map[string]bool{}
 		for _, imp := range pkgs[id].imports {
-			if !strings.HasPrefix(imp, modulePath) {
+			if !underModule(imp, modulePath) {
 				continue
 			}
 			to := trimModulePrefix(imp, modulePath)
@@ -195,7 +195,10 @@ func GraphModel(repoDir, moduleDir string) (*Graph, error) {
 			desc = GraphDescription{Text: doc.GodocText, Source: "godoc"}
 		}
 
-		var links []GraphLink
+		// Always a JSON array, never null: the renderer iterates links[]
+		// and a null would force a defensive guard in the (security-
+		// sensitive) front end for no reason.
+		links := []GraphLink{}
 		if doc.Task != "" {
 			links = append(links, GraphLink{Type: InferLinkType(doc.Task), ID: doc.Task})
 		}
@@ -249,24 +252,32 @@ func repoRelPath(relModuleDir, id string) string {
 	return relModuleDir + "/" + id
 }
 
-// churnByPackageDir loads repoDir/obs-data/hotspots.json (if present) and
-// sums each file's churn (commit count) onto its containing directory —
-// the per-package churn metric (design spec §5.2). Packages with no
-// matching hotspot entry simply get 0 via the zero value of the returned
-// map, so a missing/absent hotspots.json is not an error.
+// underModule reports whether importPath is the module itself or a package
+// within it — a prefix test that, unlike strings.HasPrefix(imp,
+// modulePath), won't mistake a sibling module "example.com/foobar" for a
+// package of "example.com/foo".
+func underModule(importPath, modulePath string) bool {
+	return importPath == modulePath || strings.HasPrefix(importPath, modulePath+"/")
+}
+
+// churnByPackageDir computes per-directory churn directly from git history
+// (reusing Hotspots' aggregation with no file-count cap), summing each
+// file's commit count onto its containing directory — the per-package
+// churn metric (design spec §5.2).
+//
+// It deliberately does NOT read obs-data/hotspots.json: the Service map tab
+// is generated before the Hotspots tab, so that artifact may be stale or
+// absent on a fresh repo, which would make the whole map render churn 0.
+// Computing from git keeps the map self-sufficient and always fresh. If git
+// is unavailable (e.g. the target isn't a git repo at all), churn degrades
+// to 0 rather than failing the generator — churn is an enrichment, not a
+// prerequisite for the map.
 func churnByPackageDir(repoDir string) (map[string]int, error) {
-	b, err := os.ReadFile(filepath.Join(repoDir, "obs-data", "hotspots.json"))
-	if os.IsNotExist(err) {
-		return map[string]int{}, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read obs-data/hotspots.json: %w", err)
-	}
-	var stats []FileStat
-	if err := json.Unmarshal(b, &stats); err != nil {
-		return nil, fmt.Errorf("parse obs-data/hotspots.json: %w", err)
-	}
 	byDir := map[string]int{}
+	stats, err := Hotspots(repoDir, "", 0) // top=0: every file, no cap
+	if err != nil {
+		return byDir, nil // non-git / no history: churn 0 everywhere, not fatal
+	}
 	for _, s := range stats {
 		dir := filepath.ToSlash(filepath.Dir(filepath.ToSlash(s.Path)))
 		byDir[dir] += s.Churn
@@ -274,8 +285,9 @@ func churnByPackageDir(repoDir string) (map[string]int, error) {
 	return byDir, nil
 }
 
-// countGoFiles returns how many *.go files sit directly in dir (not
-// recursive) — location.files.
+// countGoFiles returns how many non-test *.go files sit directly in dir
+// (not recursive) — location.files. Test files are excluded to match the
+// `go list` GoFiles set the rest of the model is built from.
 func countGoFiles(dir string) int {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -283,7 +295,8 @@ func countGoFiles(dir string) int {
 	}
 	n := 0
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".go") {
+		name := e.Name()
+		if !e.IsDir() && strings.HasSuffix(name, ".go") && !strings.HasSuffix(name, "_test.go") {
 			n++
 		}
 	}
@@ -292,7 +305,9 @@ func countGoFiles(dir string) int {
 
 // sumLines returns the total line count across every *.go file directly in
 // dir — metrics.loc. Best-effort: unreadable files are skipped rather than
-// failing the whole generator.
+// failing the whole generator. The scanner uses a large line buffer so
+// files with very long lines (generated code, embedded data) are counted,
+// not truncated at bufio's 64 KB default.
 func sumLines(dir string) int {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -308,6 +323,7 @@ func sumLines(dir string) int {
 			continue
 		}
 		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 		for sc.Scan() {
 			total++
 		}
