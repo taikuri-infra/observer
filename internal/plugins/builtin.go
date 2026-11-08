@@ -71,7 +71,7 @@ func DefaultTabs(repo string) ([]manifest.Tab, error) {
 
 	tabs = append(tabs, databaseTabs(migrationsDirs)...)
 	tabs = append(tabs, goDepsTabs(goModules)...)
-	tabs = append(tabs, goCallGraphTabs(goModules)...)
+	tabs = append(tabs, goCallGraphTabs(repo, goModules)...)
 	tabs = append(tabs, frontendDepsTabs(repo, frontendModules)...)
 	tabs = append(tabs, hotspotsTab())
 
@@ -159,19 +159,52 @@ func goDepsTabs(goModules []string) []manifest.Tab {
 	return tabs
 }
 
-// goCallGraphTabs uses the external go-callvis tool — one per detected Go
-// module. R13: the default command omits -focus.
-func goCallGraphTabs(goModules []string) []manifest.Tab {
-	var tabs []manifest.Tab
+// goCallGraphTabs uses the external go-callvis tool. go-callvis analyses a
+// single binary entry point — its default -focus is the `main` package — so a
+// module with more than one main (e.g. servicePlus's services/api, which has
+// cmd/server plus a handful of one-off command/script mains) can't be graphed
+// with a single `./...` invocation: that fails with "found multiple packages
+// with name: main". Instead we detect each module's main packages and emit one
+// focused call-graph tab per main, each targeting that package's directory.
+// R13 still holds: the command omits an explicit -focus (a single-main target
+// already disambiguates it).
+func goCallGraphTabs(repo string, goModules []string) []manifest.Tab {
+	type entry struct{ module, mainRel, label string }
+	var entries []entry
 	for _, mod := range goModules {
-		out := outputName("callgraph.svg", mod, len(goModules))
+		mains, err := findMainPackages(filepath.Join(repo, mod))
+		if err != nil {
+			continue // best-effort: a module we can't scan simply gets no call-graph tab
+		}
+		for _, m := range filterSafeRel(mains) {
+			// label disambiguates both the tab name and the artifact
+			// filename, using the main package's repo-relative path so
+			// sibling mains (cmd/server vs cmd/worker) never collide.
+			label := m
+			if mod != "" && mod != "." {
+				label = mod
+				if m != "." {
+					label = mod + "/" + m
+				}
+			}
+			entries = append(entries, entry{module: mod, mainRel: m, label: label})
+		}
+	}
+
+	var tabs []manifest.Tab
+	for _, e := range entries {
+		out := outputName("callgraph.svg", e.label, len(entries))
 		stem := strings.TrimSuffix(out, ".svg")
+		target := "./" + e.mainRel
+		if e.mainRel == "." {
+			target = "."
+		}
 		tabs = append(tabs, manifest.Tab{
-			Name:     tabName("Go call graph", mod, len(goModules)),
+			Name:     tabName("Go call graph", e.label, len(entries)),
 			Kind:     manifest.KindGenerator,
-			Command:  fmt.Sprintf("go-callvis -format svg -file '%sobs-data/%s' -nostd ./...", upPath(mod), stem),
+			Command:  fmt.Sprintf("go-callvis -format svg -file '%sobs-data/%s' -nostd '%s'", upPath(e.module), stem, target),
 			Output:   out,
-			Dir:      mod,
+			Dir:      e.module,
 			Renderer: "svg",
 			Requires: []string{"go-callvis"},
 		})

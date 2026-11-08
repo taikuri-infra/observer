@@ -259,6 +259,7 @@
     div.className = "render-svg";
     div.innerHTML = safeSVG(text);
     setContent(div);
+    mountInteractiveSVG(div);
   }
 
   function renderMermaid(text) {
@@ -296,6 +297,7 @@
       .then(function (viz) {
         var svgEl = viz.renderSVGElement(text);
         div.innerHTML = safeSVG(svgEl.outerHTML);
+        mountInteractiveSVG(div);
       })
       .catch(function (err) {
         div.innerHTML =
@@ -311,6 +313,252 @@
       state.vizInstance = viz;
       return viz;
     });
+  }
+
+  // ---- Interactive graph viewport (pan / zoom / focus) ----
+  //
+  // Turns a freshly-rendered graphviz SVG (viz.js graph tabs or raw
+  // go-callvis output) into something explorable instead of a static wall of
+  // boxes: scroll-wheel to zoom toward the cursor, drag to pan, and click a
+  // node to focus it — the node, its incident edges, and their adjacent nodes
+  // stay lit while everything else dims, so a single call's neighbourhood is
+  // legible in an otherwise dense graph. A small control cluster offers zoom
+  // in / out and fit-to-view. Operates purely on the already-sanitized DOM
+  // (event listeners plus class/transform toggles), so it introduces no new
+  // HTML-injection surface.
+  function mountInteractiveSVG(container) {
+    var svg = container.querySelector("svg");
+    if (!svg) return;
+
+    // Normalise the svg so our transforms are the only thing sizing it.
+    svg.removeAttribute("width");
+    svg.removeAttribute("height");
+    svg.style.transformOrigin = "0 0";
+    svg.style.position = "absolute";
+    svg.style.top = "0";
+    svg.style.left = "0";
+    svg.style.maxWidth = "none";
+
+    // Intrinsic graph size (graphviz always emits a viewBox).
+    var vb = (svg.getAttribute("viewBox") || "").split(/\s+/).map(Number);
+    var gw = vb.length === 4 && vb[2] ? vb[2] : 1000;
+    var gh = vb.length === 4 && vb[3] ? vb[3] : 1000;
+    svg.style.width = gw + "px";
+    svg.style.height = gh + "px";
+
+    var view = { scale: 1, tx: 0, ty: 0 };
+    var MIN = 0.05,
+      MAX = 8;
+
+    function clamp(s) {
+      return Math.max(MIN, Math.min(MAX, s));
+    }
+    function apply() {
+      svg.style.transform =
+        "translate(" + view.tx + "px," + view.ty + "px) scale(" + view.scale + ")";
+    }
+    function fit() {
+      var cw = container.clientWidth,
+        ch = container.clientHeight;
+      if (!cw || !ch) return;
+      view.scale = clamp(Math.min(cw / gw, ch / gh) * 0.95);
+      view.tx = (cw - gw * view.scale) / 2;
+      view.ty = (ch - gh * view.scale) / 2;
+      apply();
+    }
+    function zoomAt(px, py, factor) {
+      var gx = (px - view.tx) / view.scale;
+      var gy = (py - view.ty) / view.scale;
+      view.scale = clamp(view.scale * factor);
+      view.tx = px - gx * view.scale;
+      view.ty = py - gy * view.scale;
+      apply();
+    }
+    function zoomCenter(factor) {
+      zoomAt(container.clientWidth / 2, container.clientHeight / 2, factor);
+    }
+
+    container.addEventListener(
+      "wheel",
+      function (e) {
+        e.preventDefault();
+        var rect = container.getBoundingClientRect();
+        zoomAt(
+          e.clientX - rect.left,
+          e.clientY - rect.top,
+          e.deltaY < 0 ? 1.15 : 1 / 1.15
+        );
+      },
+      { passive: false }
+    );
+
+    // Drag to pan. `moved` lets the focus handler tell a pan from a click.
+    var dragging = false,
+      moved = false,
+      lastX = 0,
+      lastY = 0;
+    container.addEventListener("pointerdown", function (e) {
+      dragging = true;
+      moved = false;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      try {
+        container.setPointerCapture(e.pointerId);
+      } catch (_) {}
+      container.classList.add("gv-grabbing");
+    });
+    container.addEventListener("pointermove", function (e) {
+      if (!dragging) return;
+      var dx = e.clientX - lastX,
+        dy = e.clientY - lastY;
+      if (!moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) moved = true;
+      if (moved) {
+        view.tx += dx;
+        view.ty += dy;
+        lastX = e.clientX;
+        lastY = e.clientY;
+        apply();
+      }
+    });
+    function endDrag(e) {
+      dragging = false;
+      container.classList.remove("gv-grabbing");
+      try {
+        container.releasePointerCapture(e.pointerId);
+      } catch (_) {}
+    }
+    container.addEventListener("pointerup", endDrag);
+    container.addEventListener("pointercancel", endDrag);
+
+    wireGraphFocus(svg, function wasDrag() {
+      return moved;
+    });
+
+    container.appendChild(
+      buildGraphControls({
+        zoomIn: function () {
+          zoomCenter(1.3);
+        },
+        zoomOut: function () {
+          zoomCenter(1 / 1.3);
+        },
+        reset: fit,
+      })
+    );
+
+    // Fit once layout has settled (container has a measurable size).
+    requestAnimationFrame(fit);
+  }
+
+  // wireGraphFocus wires click-to-focus over a graphviz svg's node/edge
+  // groups. Adjacency is read from each edge's <title> ("tail->head" for
+  // digraphs, "tail--head" for undirected), matched against node <title>s.
+  function wireGraphFocus(svg, wasDrag) {
+    var nodes = Array.prototype.slice.call(svg.querySelectorAll("g.node"));
+    var edges = Array.prototype.slice.call(svg.querySelectorAll("g.edge"));
+    if (nodes.length === 0) return;
+
+    function titleOf(g) {
+      var t = g.querySelector("title");
+      return t ? t.textContent.trim() : "";
+    }
+
+    var nodeByName = {};
+    nodes.forEach(function (g) {
+      nodeByName[titleOf(g)] = g;
+    });
+
+    var adj = {};
+    function ensure(n) {
+      return adj[n] || (adj[n] = { nbrs: {}, edges: [] });
+    }
+    edges.forEach(function (g) {
+      var parts = titleOf(g).split(/->|--/);
+      var a = parts[0] && parts[0].trim();
+      var b = parts[1] && parts[1].trim();
+      if (nodeByName[a]) {
+        ensure(a).nbrs[b] = true;
+        ensure(a).edges.push(g);
+      }
+      if (nodeByName[b]) {
+        ensure(b).nbrs[a] = true;
+        ensure(b).edges.push(g);
+      }
+    });
+
+    var focused = null;
+    var all = nodes.concat(edges);
+
+    function clearFocus() {
+      focused = null;
+      svg.classList.remove("gv-has-focus");
+      all.forEach(function (g) {
+        g.classList.remove("gv-dim", "gv-lit", "gv-root");
+      });
+    }
+    function focusNode(name) {
+      focused = name;
+      svg.classList.add("gv-has-focus");
+      var keep = {};
+      keep[name] = true;
+      var a = adj[name] || { nbrs: {}, edges: [] };
+      Object.keys(a.nbrs).forEach(function (n) {
+        keep[n] = true;
+      });
+      nodes.forEach(function (g) {
+        var nm = titleOf(g);
+        g.classList.toggle("gv-lit", !!keep[nm]);
+        g.classList.toggle("gv-dim", !keep[nm]);
+        g.classList.toggle("gv-root", nm === name);
+      });
+      edges.forEach(function (g) {
+        var on = a.edges.indexOf(g) !== -1;
+        g.classList.toggle("gv-lit", on);
+        g.classList.toggle("gv-dim", !on);
+      });
+    }
+
+    nodes.forEach(function (g) {
+      g.style.cursor = "pointer";
+      g.addEventListener("click", function (e) {
+        if (wasDrag()) return;
+        e.stopPropagation();
+        var nm = titleOf(g);
+        if (focused === nm) clearFocus();
+        else focusNode(nm);
+      });
+    });
+    svg.addEventListener("click", function () {
+      if (wasDrag()) return;
+      clearFocus();
+    });
+  }
+
+  function buildGraphControls(handlers) {
+    var wrap = document.createElement("div");
+    wrap.className = "gv-controls";
+    var specs = [
+      ["+", handlers.zoomIn, "Zoom in"],
+      ["−", handlers.zoomOut, "Zoom out"],
+      ["⤢", handlers.reset, "Fit to view"],
+    ];
+    specs.forEach(function (spec) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "gv-btn";
+      b.textContent = spec[0];
+      b.title = spec[2];
+      b.addEventListener("click", function (e) {
+        e.stopPropagation();
+        spec[1]();
+      });
+      // Don't let interacting with the controls start a pan or clear focus.
+      b.addEventListener("pointerdown", function (e) {
+        e.stopPropagation();
+      });
+      wrap.appendChild(b);
+    });
+    return wrap;
   }
 
   function renderTable(text) {

@@ -4,6 +4,8 @@
 package plugins
 
 import (
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -112,6 +114,74 @@ func findMigrationsDirs(moduleDir string) ([]string, error) {
 	}
 	sort.Strings(found)
 	return found, nil
+}
+
+// findMainPackages walks moduleDir's subtree — skipping skipDirs, hidden
+// dirs, and any nested Go module (a `package main` inside a nested module
+// belongs to that module, not this one) — and returns every directory,
+// relative to moduleDir ("/" separated, sorted), that holds at least one
+// non-test .go file declaring `package main`. These are the module's binary
+// entry points: each is a valid single go-callvis focus target, which a
+// multi-main module needs because go-callvis over `./...` fails with "found
+// multiple packages with name: main".
+func findMainPackages(moduleDir string) ([]string, error) {
+	seen := map[string]bool{}
+	var found []string
+	err := filepath.WalkDir(moduleDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, relErr := filepath.Rel(moduleDir, path)
+		if relErr != nil {
+			return relErr
+		}
+		rel = filepath.ToSlash(rel)
+
+		if d.IsDir() {
+			if rel == "." {
+				return nil
+			}
+			if skipDirs[d.Name()] || isHidden(d.Name()) {
+				return filepath.SkipDir
+			}
+			// Don't cross into a nested Go module's own package tree.
+			if _, statErr := os.Stat(filepath.Join(path, "go.mod")); statErr == nil {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		dir := filepath.ToSlash(filepath.Dir(rel))
+		if seen[dir] {
+			return nil // this package is already recorded as main
+		}
+		name := d.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		if filePackageName(path) == "main" {
+			seen[dir] = true
+			found = append(found, dir)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(found)
+	return found, nil
+}
+
+// filePackageName returns the package clause of a .go file (parsing only the
+// clause, not the body — cheap and tolerant of build-constraint comments),
+// or "" if the file can't be read or parsed.
+func filePackageName(path string) string {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, nil, parser.PackageClauseOnly)
+	if err != nil || f.Name == nil {
+		return ""
+	}
+	return f.Name.Name
 }
 
 // hasUpSQL reports whether dir directly contains at least one *.sql file

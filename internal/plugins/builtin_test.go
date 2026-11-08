@@ -33,6 +33,7 @@ func TestDefaultTabsFixture(t *testing.T) {
 		}
 	}
 	write("services/api/go.mod", "module example.com/api\n\ngo 1.22\n")
+	write("services/api/cmd/app/main.go", "package main\n\nfunc main() {}\n")
 	write("services/api/internal/adapters/postgres/tenant_migrations/001_x.sql",
 		"CREATE TABLE x (\n    id UUID PRIMARY KEY\n);\n")
 	write("services/api/internal/adapters/postgres/tenant_migrations/001_x_down.sql",
@@ -67,6 +68,8 @@ func TestDefaultTabsFixture(t *testing.T) {
 		t.Fatalf("Go deps command should write back up to top-level obs-data: %q", goDeps.Command)
 	}
 
+	// The fixture module has exactly one main package (cmd/app), so the tab
+	// keeps the undisambiguated name and must target that package directory.
 	callGraph, ok := findTabByName(tabs, "Go call graph")
 	if !ok {
 		t.Fatalf("missing Go call graph tab: %+v", tabs)
@@ -76,6 +79,12 @@ func TestDefaultTabsFixture(t *testing.T) {
 	}
 	if strings.Contains(callGraph.Command, "-focus") {
 		t.Fatalf("default go-callvis command must omit -focus (R13): %q", callGraph.Command)
+	}
+	if !strings.Contains(callGraph.Command, "'./cmd/app'") {
+		t.Fatalf("Go call graph command must target the detected main package: %q", callGraph.Command)
+	}
+	if strings.Contains(callGraph.Command, "./...") {
+		t.Fatalf("Go call graph command must not use ./... (multi-main hazard): %q", callGraph.Command)
 	}
 
 	db, ok := findTabByName(tabs, "Database")
@@ -134,9 +143,36 @@ func TestDefaultTabsServicePlus(t *testing.T) {
 		t.Fatalf("Go deps Dir = %q, want services/api", goDeps.Dir)
 	}
 
-	callGraph, ok := findTabByName(tabs, "Go call graph")
-	if !ok || callGraph.Dir != "services/api" {
-		t.Fatalf("missing/incorrect Go call graph tab: %+v (ok=%v)", callGraph, ok)
+	// servicePlus's services/api has several main packages (cmd/server,
+	// cmd/retention-sweeper, scripts/...), so DefaultTabs must emit one
+	// focused call-graph tab per main — each targeting the api module and a
+	// single main package, never `./...` (which fails on multiple mains).
+	var callGraphs []manifest.Tab
+	for _, tab := range tabs {
+		if strings.HasPrefix(tab.Name, "Go call graph") {
+			callGraphs = append(callGraphs, tab)
+		}
+	}
+	if len(callGraphs) == 0 {
+		t.Fatalf("missing Go call graph tab(s) for servicePlus: %+v", tabs)
+	}
+	foundServerMain := false
+	for _, cg := range callGraphs {
+		if cg.Dir != "services/api" {
+			t.Fatalf("Go call graph tab Dir = %q, want services/api: %+v", cg.Dir, cg)
+		}
+		if len(cg.Requires) == 0 || cg.Requires[0] != "go-callvis" {
+			t.Fatalf("Go call graph tab must require go-callvis: %+v", cg)
+		}
+		if strings.Contains(cg.Command, "./...") {
+			t.Fatalf("Go call graph command must not use ./... (multi-main hazard): %q", cg.Command)
+		}
+		if strings.Contains(cg.Command, "cmd/server") {
+			foundServerMain = true
+		}
+	}
+	if !foundServerMain {
+		t.Fatalf("expected a Go call graph tab targeting cmd/server: %+v", callGraphs)
 	}
 
 	var dbTabs []manifest.Tab
@@ -159,6 +195,40 @@ func TestDefaultTabsServicePlus(t *testing.T) {
 	}
 	if !foundTenantMigrations {
 		t.Fatalf("no Database tab references tenant_migrations: %+v", dbTabs)
+	}
+}
+
+// TestFindMainPackages pins down main-package detection: every directory with
+// a `package main` .go file is found (build-tagged files included), while
+// nested modules, skip dirs, and non-main packages are excluded.
+func TestFindMainPackages(t *testing.T) {
+	repo := t.TempDir()
+	write := func(rel, content string) {
+		path := filepath.Join(repo, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", "module example.com/m\n\ngo 1.22\n")
+	write("internal/lib/lib.go", "package lib\n")                                        // not main
+	write("cmd/server/main.go", "package main\n\nfunc main() {}\n")                      // main
+	write("cmd/worker/main.go", "//go:build linux\n\npackage main\n\nfunc main() {}\n")  // build-tagged main
+	write("scripts/tool/main.go", "package main\n\nfunc main() {}\n")                    // main
+	write("cmd/server/helpers_test.go", "package main\n\n// test file, ignored\n")       // _test.go ignored
+	write("vendored/sub/go.mod", "module example.com/sub\n\ngo 1.22\n")                  // nested module
+	write("vendored/sub/main.go", "package main\n\nfunc main() {}\n")                    // belongs to sub, excluded
+	write("node_modules/pkg/main.go", "package main\n\nfunc main() {}\n")                // skip dir, excluded
+
+	got, err := findMainPackages(repo)
+	if err != nil {
+		t.Fatalf("findMainPackages: %v", err)
+	}
+	want := []string{"cmd/server", "cmd/worker", "scripts/tool"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("findMainPackages = %v, want %v", got, want)
 	}
 }
 
