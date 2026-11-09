@@ -218,6 +218,10 @@ func ERGraphModel(migrationsDir, locationPath string) (*Graph, error) {
 
 	nodes := make([]GraphNode, 0, len(tables))
 	for _, t := range tables {
+		cols := make([]TableColumn, 0, len(t.columns))
+		for _, c := range t.columns {
+			cols = append(cols, TableColumn{Name: c.name, Type: c.typ, PK: c.pk, FK: c.fk})
+		}
 		nodes = append(nodes, GraphNode{
 			ID:    t.name,
 			Label: t.name,
@@ -230,6 +234,7 @@ func ERGraphModel(migrationsDir, locationPath string) (*Graph, error) {
 			Location:    GraphLocation{Path: locationPath, Files: len(files)},
 			Description: GraphDescription{Source: "none"},
 			Links:       []GraphLink{},
+			Table:       &TableDetail{Columns: cols},
 		})
 	}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
