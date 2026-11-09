@@ -137,6 +137,48 @@ func TestERGraphModel(t *testing.T) {
 	if e := g.Edges[0]; e.From != "chat_messages" || e.To != "chat_channels" {
 		t.Errorf("edge = %+v, want chat_messages -> chat_channels", e)
 	}
+
+	// Each table node carries its full column list (for the ER card), with
+	// PK/FK flags — chat_messages has a PK (id) and an FK (channel_id).
+	if messages.Table == nil {
+		t.Fatalf("chat_messages.Table is nil, want populated column list")
+	}
+	wantCols := map[string]TableColumn{
+		"id":         {Name: "id", Type: "uuid", PK: true, FK: false},
+		"channel_id": {Name: "channel_id", Type: "uuid", PK: false, FK: true},
+		"body":       {Name: "body", Type: "text", PK: false, FK: false},
+	}
+	if len(messages.Table.Columns) != len(wantCols) {
+		t.Fatalf("chat_messages columns = %+v, want %d", messages.Table.Columns, len(wantCols))
+	}
+	for _, c := range messages.Table.Columns {
+		want, ok := wantCols[c.Name]
+		if !ok {
+			t.Errorf("unexpected column %q", c.Name)
+			continue
+		}
+		if c != want {
+			t.Errorf("column %q = %+v, want %+v", c.Name, c, want)
+		}
+	}
+
+	// A non-table node (there are none here) would omit Table — guard the
+	// chat_channels PK flag too (id is PRIMARY KEY, nothing is FK).
+	if channels.Table == nil {
+		t.Fatalf("chat_channels.Table is nil")
+	}
+	var chID TableColumn
+	for _, c := range channels.Table.Columns {
+		if c.Name == "id" {
+			chID = c
+		}
+		if c.FK {
+			t.Errorf("chat_channels has an unexpected FK column: %+v", c)
+		}
+	}
+	if !chID.PK || chID.Type != "uuid" {
+		t.Errorf("chat_channels.id = %+v, want PK uuid", chID)
+	}
 }
 
 // TestERTableLevelFK covers a table-level (here composite) FOREIGN KEY

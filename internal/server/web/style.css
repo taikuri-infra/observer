@@ -465,6 +465,21 @@ html, body {
 .map-lit .ring { filter: drop-shadow(0 0 7px currentColor); }
 .map-changed .ring { stroke: var(--accent); stroke-width: 4; filter: drop-shadow(0 0 6px var(--accent)); }
 
+/* ER table cards (kind:"table" nodes with a column list) */
+.map-card-rect { fill: var(--bg-elevated); stroke-width: 2; transition: filter 0.15s; }
+.map-card-hdr { stroke: none; }
+.map-card-title { font-family: var(--sans); font-size: 11.5px; font-weight: 600; fill: #0f1115; }
+.map-col-zebra { fill: rgba(255, 255, 255, 0.025); }
+.map-col-name { font-family: var(--mono); font-size: 10.5px; fill: var(--text); }
+.map-col-type { font-family: var(--mono); font-size: 10px; fill: var(--text-faint); }
+.map-key { font-family: var(--mono); font-size: 8px; font-weight: 700; letter-spacing: 0.02em; }
+.map-key-pk { fill: var(--map-warm); }
+.map-key-fk { fill: var(--map-adapter); }
+.map-col-more { font-family: var(--sans); font-size: 9.5px; font-style: italic; fill: var(--text-faint); }
+.map-node:hover .map-card-rect { filter: brightness(1.12); }
+.map-lit .map-card-rect { filter: drop-shadow(0 0 7px currentColor); }
+.map-changed .map-card-rect { stroke: var(--accent); stroke-width: 3; filter: drop-shadow(0 0 6px var(--accent)); }
+
 .map-zoom {
   position: absolute;
   top: 12px;
@@ -602,6 +617,15 @@ html, body {
 
 .map-changed-files { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 5px; max-height: 180px; overflow-y: auto; }
 .map-changed-files li { font-family: var(--mono); font-size: 11.5px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; color: var(--text); word-break: break-all; }
+
+/* Detail-panel column list for a table node */
+.map-col-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 3px; max-height: 260px; overflow-y: auto; }
+.map-col-list li { display: flex; align-items: center; gap: 7px; font-family: var(--mono); font-size: 11.5px; padding: 4px 8px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); }
+.map-col-list .cn { color: var(--text); word-break: break-all; }
+.map-col-list .ct { margin-left: auto; color: var(--text-faint); white-space: nowrap; }
+.map-col-list .ck { font-size: 8.5px; font-weight: 700; padding: 1px 4px; border-radius: 4px; flex: 0 0 auto; }
+.map-col-list .ck-pk { color: var(--map-warm); border: 1px solid var(--map-warm); }
+.map-col-list .ck-fk { color: var(--map-adapter); border: 1px solid var(--map-adapter); }
 
 .map-links .lk { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 7px 9px; border: 1px dashed var(--border); border-radius: var(--radius); color: var(--text-dim); margin-bottom: 6px; }
 .map-links .lk .ic { width: 17px; height: 17px; border-radius: 4px; background: var(--border); display: grid; place-items: center; font-size: 8.5px; color: var(--text-faint); font-family: var(--mono); flex: 0 0 auto; }

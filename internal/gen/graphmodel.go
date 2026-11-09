@@ -74,6 +74,24 @@ type GraphLink struct {
 	ID   string `json:"id"`
 }
 
+// TableColumn is one column of a database table node (kind "table"): its
+// name, SQL type, and whether it's a primary / foreign key — the data the
+// renderer draws as a row inside the ER table card.
+type TableColumn struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	PK   bool   `json:"pk,omitempty"`
+	FK   bool   `json:"fk,omitempty"`
+}
+
+// TableDetail carries a "table" node's full column list so the canvas can
+// draw it as a proper ER card (header + one row per column) instead of a
+// bare circle. Only ERGraphModel populates it; metrics.columns still holds
+// the count for sizing/coloring.
+type TableDetail struct {
+	Columns []TableColumn `json:"columns"`
+}
+
 type GraphNode struct {
 	ID          string           `json:"id"`
 	Label       string           `json:"label"`
@@ -88,6 +106,10 @@ type GraphNode struct {
 	// files" section).
 	Changed      bool     `json:"changed,omitempty"`
 	ChangedFiles []string `json:"changedFiles,omitempty"`
+	// Table is only populated for "table" nodes (ERGraphModel): the full
+	// column list the renderer draws as an ER card. omitempty + pointer keep
+	// it out of every other kind's JSON.
+	Table *TableDetail `json:"table,omitempty"`
 }
 
 type GraphEdge struct {

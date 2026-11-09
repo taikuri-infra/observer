@@ -525,6 +525,190 @@
       return f >= 0.66 ? "var(--map-hot)" : f >= 0.33 ? "var(--map-warm)" : "var(--map-calm)";
     }
 
+    // ---- ER table cards ----
+    //
+    // A "table" node carrying a Table.Columns list is drawn as an ER card
+    // (header + one row per column) instead of a circle. Sizes are computed
+    // once up front (cardInfo) so the SAME width/height feed the layout
+    // (dagre node box / force collide) and the draw step — otherwise cards
+    // would overlap. Everything is built SVG-native (createElementNS +
+    // textContent) in draw(); no innerHTML/foreignObject of dynamic content.
+    var CARD = {
+      headerH: 26, // table-name band
+      rowH: 20, // per-column row
+      padX: 10,
+      gutter: 36, // left zone for PK/FK badges
+      gap: 14, // min gap between a column name and its type
+      charW: 6.7, // ~width of one mono char at the row font-size
+      headCharW: 7.4, // header name is a touch larger
+      minW: 150,
+      maxW: 380,
+      maxRows: 12, // clamp tall tables; the rest go to a "+K more" row + the panel
+    };
+    function isTableCard(n) {
+      return (
+        n.kind === "table" &&
+        n.table &&
+        Array.isArray(n.table.columns) &&
+        n.table.columns.length > 0
+      );
+    }
+    // fitText truncates s (with a trailing ellipsis) to roughly maxPx at
+    // charW px/char, so a long column name/type can't overflow the card.
+    function fitText(s, maxPx, charW) {
+      s = String(s == null ? "" : s);
+      var maxChars = Math.max(1, Math.floor(maxPx / charW));
+      if (s.length <= maxChars) return s;
+      if (maxChars <= 1) return "…";
+      return s.slice(0, maxChars - 1) + "…";
+    }
+    function computeCardInfo(n) {
+      var cols = n.table.columns;
+      var visible = cols.slice(0, CARD.maxRows);
+      var hidden = cols.length - visible.length;
+      var widest = 0;
+      visible.forEach(function (c) {
+        var nameW = String(c.name || "").length * CARD.charW;
+        var typeW = String(c.type || "").length * CARD.charW;
+        var rowW = CARD.gutter + nameW + CARD.gap + typeW;
+        if (rowW > widest) widest = rowW;
+      });
+      var headerW = String(n.label || n.id || "").length * CARD.headCharW + 20;
+      var w = Math.max(CARD.minW, headerW, widest + 2 * CARD.padX);
+      w = Math.min(CARD.maxW, w);
+      var rowsCount = visible.length + (hidden > 0 ? 1 : 0);
+      var h = CARD.headerH + rowsCount * CARD.rowH + 6;
+      return { w: w, h: h, visible: visible, hidden: hidden };
+    }
+    // cardInfo caches per-table-node dimensions; non-table nodes aren't keyed.
+    var cardInfo = Object.create(null);
+    nodes.forEach(function (n) {
+      if (isTableCard(n)) cardInfo[n.id] = computeCardInfo(n);
+    });
+    // nodeExtent is a node's half-width/half-height for layout: a card's box
+    // for table nodes, the circle radius (both axes) otherwise.
+    function nodeExtent(n) {
+      if (isTableCard(n)) {
+        var ci = cardInfo[n.id];
+        return { rw: ci.w / 2, rh: ci.h / 2 };
+      }
+      var r = radiusFor(n);
+      return { rw: r, rh: r };
+    }
+    // roundedTopRectPath draws a rect with only the TOP two corners rounded
+    // (square bottom) — the ER card's header band, sitting flush on the
+    // card body below it.
+    function roundedTopRectPath(x, y, w, h, r) {
+      return (
+        "M" + (x + r) + "," + y +
+        " h" + (w - 2 * r) +
+        " a" + r + "," + r + " 0 0 1 " + r + "," + r +
+        " v" + (h - r) +
+        " h" + -w +
+        " v" + -(h - r) +
+        " a" + r + "," + r + " 0 0 1 " + r + "," + -r +
+        " z"
+      );
+    }
+    // drawTableCard appends an ER card (rounded body + kind-colored header +
+    // one row per column with PK/FK badges) to grp, centered on pos. Purely
+    // SVG nodes built via svgEl/textContent — no HTML strings. Used only for
+    // table nodes; every other kind keeps its circle.
+    function drawTableCard(grp, n, pos, heat, color) {
+      var ci = cardInfo[n.id];
+      var w = ci.w,
+        h = ci.h;
+      var left = pos.x - w / 2,
+        top = pos.y - h / 2;
+
+      // Body (rounded, stroke by colorBy heat like a circle's ring).
+      grp.appendChild(
+        svgEl("rect", {
+          class: "map-card-rect",
+          x: left,
+          y: top,
+          width: w,
+          height: h,
+          rx: 8,
+          ry: 8,
+          stroke: heat,
+        })
+      );
+      // Header band, filled with the kind color.
+      var hdr = svgEl("path", { class: "map-card-hdr", d: roundedTopRectPath(left, top, w, CARD.headerH, 8) });
+      hdr.style.fill = color;
+      grp.appendChild(hdr);
+      var title = svgEl("text", {
+        class: "map-card-title",
+        x: left + CARD.padX,
+        y: top + CARD.headerH / 2,
+        "dominant-baseline": "central",
+      });
+      title.textContent = fitText(n.label || n.id, w - 2 * CARD.padX, CARD.headCharW);
+      grp.appendChild(title);
+
+      var rowsTop = top + CARD.headerH;
+      ci.visible.forEach(function (c, i) {
+        var rowY = rowsTop + i * CARD.rowH;
+        var centerY = rowY + CARD.rowH / 2;
+        if (i % 2 === 1) {
+          grp.appendChild(
+            svgEl("rect", { class: "map-col-zebra", x: left + 1, y: rowY, width: w - 2, height: CARD.rowH })
+          );
+        }
+        var gutterX = left + CARD.padX;
+        var nameX = left + CARD.padX + CARD.gutter;
+        var typeX = left + w - CARD.padX;
+
+        // PK / FK badges in the left gutter.
+        var badgeX = gutterX;
+        if (c.pk) {
+          var pk = svgEl("text", { class: "map-key map-key-pk", x: badgeX, y: centerY, "dominant-baseline": "central" });
+          pk.textContent = "PK";
+          grp.appendChild(pk);
+          badgeX += 18;
+        }
+        if (c.fk) {
+          var fk = svgEl("text", { class: "map-key map-key-fk", x: badgeX, y: centerY, "dominant-baseline": "central" });
+          fk.textContent = "FK";
+          grp.appendChild(fk);
+        }
+
+        // Type on the right (reserve ~45% of the inner width), name fills
+        // the rest — both truncated so neither overflows the card.
+        var innerW = w - CARD.gutter - 2 * CARD.padX;
+        var typeStr = fitText(c.type, innerW * 0.45, CARD.charW);
+        var typeW = typeStr.length * CARD.charW;
+        var nameStr = fitText(c.name, typeX - nameX - typeW - CARD.gap, CARD.charW);
+
+        var nameEl = svgEl("text", { class: "map-col-name", x: nameX, y: centerY, "dominant-baseline": "central" });
+        nameEl.textContent = nameStr;
+        grp.appendChild(nameEl);
+
+        var typeEl = svgEl("text", {
+          class: "map-col-type",
+          x: typeX,
+          y: centerY,
+          "text-anchor": "end",
+          "dominant-baseline": "central",
+        });
+        typeEl.textContent = typeStr;
+        grp.appendChild(typeEl);
+      });
+
+      if (ci.hidden > 0) {
+        var moreY = rowsTop + ci.visible.length * CARD.rowH + CARD.rowH / 2;
+        var more = svgEl("text", {
+          class: "map-col-more",
+          x: left + CARD.padX,
+          y: moreY,
+          "dominant-baseline": "central",
+        });
+        more.textContent = "+" + ci.hidden + " more column" + (ci.hidden === 1 ? "" : "s");
+        grp.appendChild(more);
+      }
+    }
+
     // ---- DOM scaffold ----
     var root = document.createElement("div");
     root.className = "render-map";
@@ -749,8 +933,13 @@
         return {};
       });
       nodes.forEach(function (n) {
-        var r = radiusFor(n);
-        g.setNode(n.id, { width: r * 2 + 12, height: r * 2 + 12 });
+        if (isTableCard(n)) {
+          var ci = cardInfo[n.id];
+          g.setNode(n.id, { width: ci.w + 12, height: ci.h + 12 });
+        } else {
+          var r = radiusFor(n);
+          g.setNode(n.id, { width: r * 2 + 12, height: r * 2 + 12 });
+        }
       });
       edges.forEach(function (e) {
         if (byId[e.from] && byId[e.to]) g.setEdge(e.from, e.to);
@@ -775,7 +964,11 @@
     function forceLayout() {
       var d3 = window.d3;
       var simNodes = nodes.map(function (n) {
-        return { id: n.id, r: radiusFor(n) };
+        var e = nodeExtent(n);
+        // r (collide radius) is the box's half-diagonal so cards don't
+        // overlap; rw/rh drive the viewBox extent so a wide/tall card near
+        // the edge isn't clipped.
+        return { id: n.id, rw: e.rw, rh: e.rh, r: Math.sqrt(e.rw * e.rw + e.rh * e.rh) };
       });
       var idx = Object.create(null);
       simNodes.forEach(function (sn) {
@@ -816,10 +1009,10 @@
         maxX = -Infinity,
         maxY = -Infinity;
       simNodes.forEach(function (sn) {
-        minX = Math.min(minX, sn.x - sn.r);
-        minY = Math.min(minY, sn.y - sn.r);
-        maxX = Math.max(maxX, sn.x + sn.r);
-        maxY = Math.max(maxY, sn.y + sn.r);
+        minX = Math.min(minX, sn.x - sn.rw);
+        minY = Math.min(minY, sn.y - sn.rh);
+        maxX = Math.max(maxX, sn.x + sn.rw);
+        maxY = Math.max(maxY, sn.y + sn.rh);
       });
       if (!isFinite(minX)) {
         minX = minY = 0;
@@ -876,34 +1069,39 @@
         var grp = svgEl("g", { class: "map-node", "data-id": id, "data-kind": n.kind });
         if (n.changed) grp.classList.add("map-changed");
         grp.style.color = heat;
-        grp.appendChild(svgEl("circle", { class: "ring", cx: pos.x, cy: pos.y, r: r, stroke: heat }));
 
-        var gl = svgEl("text", {
-          class: "glyph",
-          x: pos.x,
-          y: pos.y + 0.5,
-          "text-anchor": "middle",
-          "dominant-baseline": "central",
-          fill: color,
-        });
-        gl.textContent = MAP_KIND_GLYPH[n.kind] || "●";
-        grp.appendChild(gl);
+        if (isTableCard(n)) {
+          drawTableCard(grp, n, pos, heat, color);
+        } else {
+          grp.appendChild(svgEl("circle", { class: "ring", cx: pos.x, cy: pos.y, r: r, stroke: heat }));
 
-        var lb = svgEl("text", { class: "label", x: pos.x + r + 6, y: pos.y - 3, "text-anchor": "start" });
-        lb.textContent = n.label || n.id;
-        grp.appendChild(lb);
+          var gl = svgEl("text", {
+            class: "glyph",
+            x: pos.x,
+            y: pos.y + 0.5,
+            "text-anchor": "middle",
+            "dominant-baseline": "central",
+            fill: color,
+          });
+          gl.textContent = MAP_KIND_GLYPH[n.kind] || "●";
+          grp.appendChild(gl);
 
-        var sb = svgEl("text", { class: "sub", x: pos.x + r + 6, y: pos.y + 8, "text-anchor": "start" });
-        // First two non-zero metrics for THIS node's kind (e.g. "cols 8 ·
-        // fk← 1" for a table, "in 3 · out 2" for a func), not a hardcoded
-        // dependents/imports pair that reads "dep 0 · imp 0" on either.
-        sb.textContent = nodeMetricEntries(n)
-          .slice(0, 2)
-          .map(function (e) {
-            return MAP_METRIC_ABBR[e[0]] + " " + e[1];
-          })
-          .join(" · ");
-        grp.appendChild(sb);
+          var lb = svgEl("text", { class: "label", x: pos.x + r + 6, y: pos.y - 3, "text-anchor": "start" });
+          lb.textContent = n.label || n.id;
+          grp.appendChild(lb);
+
+          var sb = svgEl("text", { class: "sub", x: pos.x + r + 6, y: pos.y + 8, "text-anchor": "start" });
+          // First two non-zero metrics for THIS node's kind (e.g. "cols 8 ·
+          // fk← 1" for a table, "in 3 · out 2" for a func), not a hardcoded
+          // dependents/imports pair that reads "dep 0 · imp 0" on either.
+          sb.textContent = nodeMetricEntries(n)
+            .slice(0, 2)
+            .map(function (e) {
+              return MAP_METRIC_ABBR[e[0]] + " " + e[1];
+            })
+            .join(" · ");
+          grp.appendChild(sb);
+        }
 
         gNodes.appendChild(grp);
         nodeEls[id] = grp;
@@ -1230,6 +1428,45 @@
       metSec.appendChild(metH);
       metSec.appendChild(mrow);
       pb.appendChild(metSec);
+
+      // Columns (only for "table" nodes — the full list, including any the
+      // card clamped away with its "+K more" row).
+      if (isTableCard(n)) {
+        var colSec = document.createElement("div");
+        colSec.className = "map-psec";
+        var cols = n.table.columns;
+        var colH = document.createElement("h5");
+        colH.textContent = "Columns (" + cols.length + ")";
+        colSec.appendChild(colH);
+        var colList = document.createElement("ul");
+        colList.className = "map-col-list";
+        cols.forEach(function (c) {
+          var li = document.createElement("li");
+          var nm = document.createElement("span");
+          nm.className = "cn";
+          nm.textContent = c.name;
+          li.appendChild(nm);
+          if (c.pk) {
+            var pkB = document.createElement("span");
+            pkB.className = "ck ck-pk";
+            pkB.textContent = "PK";
+            li.appendChild(pkB);
+          }
+          if (c.fk) {
+            var fkB = document.createElement("span");
+            fkB.className = "ck ck-fk";
+            fkB.textContent = "FK";
+            li.appendChild(fkB);
+          }
+          var ty = document.createElement("span");
+          ty.className = "ct";
+          ty.textContent = c.type;
+          li.appendChild(ty);
+          colList.appendChild(li);
+        });
+        colSec.appendChild(colList);
+        pb.appendChild(colSec);
+      }
 
       // Changed files (only for nodes flagged by gen.ChangedGraphModel)
       if (n.changed) {
