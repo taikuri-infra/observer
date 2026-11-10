@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/taikuri-infra/observer/internal/atref"
 	"github.com/taikuri-infra/observer/internal/manifest"
@@ -244,21 +245,33 @@ func TestGraphAtRefCleansUpOnBuildError(t *testing.T) {
 	}
 }
 
-// TestGraphAtRefWorkingTreeSkipsWorktree asserts that ref == "" and
-// ref == atref.WorkingRef both build directly against repo (no worktree
-// ever created) and land their output in repo's own obs-data/.
-func TestGraphAtRefWorkingTreeSkipsWorktree(t *testing.T) {
+// TestGraphAtRefWorkingTreeServesExistingArtifact asserts that ref == "" and
+// ref == atref.WorkingRef both serve the EXISTING repo/obs-data/<output>
+// artifact as-is — no generator run (a marker-guarded command would run at
+// most zero times), no worktree — and that a missing artifact is a clear
+// error, not a silent rebuild.
+func TestGraphAtRefWorkingTreeServesExistingArtifact(t *testing.T) {
 	repo := initRepo(t)
 	writeFile(t, repo, "README.md", "x\n")
 	commitAll(t, repo, "init")
 
+	// A command that, if ever run, would FAIL the test by proving a working
+	// ref rebuilt instead of serving the existing file.
 	tab := manifest.Tab{
 		Name:    "Direct",
 		Kind:    manifest.KindGenerator,
-		Command: "mkdir -p obs-data && printf '{\"ok\":true}' > obs-data/direct.json",
+		Command: "exit 3",
 		Output:  "direct.json",
 	}
 
+	// Missing artifact -> clear error, no generator run.
+	if _, err := atref.GraphAtRef(repo, tab, ""); err == nil {
+		t.Fatal("expected an error when the working-tree artifact doesn't exist yet")
+	}
+
+	// Pre-generate the artifact (as /api/update would), then both working
+	// refs must serve it verbatim.
+	writeFile(t, repo, "obs-data/direct.json", `{"ok":true}`)
 	for _, ref := range []string{"", atref.WorkingRef} {
 		b, err := atref.GraphAtRef(repo, tab, ref)
 		if err != nil {
@@ -270,10 +283,38 @@ func TestGraphAtRefWorkingTreeSkipsWorktree(t *testing.T) {
 	}
 
 	assertOnlyMainWorktree(t, repo)
+}
 
-	if _, err := os.Stat(filepath.Join(repo, "obs-data", "direct.json")); err != nil {
-		t.Fatalf("expected the working-tree artifact to land directly in repo/obs-data: %v", err)
+// TestGraphAtRefBuildTimeoutCleansUp shrinks BuildTimeout and points a tab
+// at a generator that sleeps far longer, proving the build is killed on
+// timeout (returns promptly with an error) and the ephemeral worktree is
+// still cleaned up afterward — a hung analyzer can't wedge the server.
+func TestGraphAtRefBuildTimeoutCleansUp(t *testing.T) {
+	repo := initRepo(t)
+	writeFile(t, repo, "README.md", "x\n")
+	sha := commitAll(t, repo, "init")
+
+	prev := atref.BuildTimeout
+	atref.BuildTimeout = 300 * time.Millisecond
+	defer func() { atref.BuildTimeout = prev }()
+
+	tab := manifest.Tab{
+		Name:    "Slow",
+		Kind:    manifest.KindGenerator,
+		Command: "sleep 30 && mkdir -p obs-data && printf '{}' > obs-data/slow.json",
+		Output:  "slow.json",
 	}
+
+	start := time.Now()
+	_, err := atref.GraphAtRef(repo, tab, sha)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected a timeout error, got nil")
+	}
+	if elapsed > 10*time.Second {
+		t.Fatalf("build was not bounded by BuildTimeout: took %v", elapsed)
+	}
+	assertOnlyMainWorktree(t, repo)
 }
 
 // TestGraphAtRefRejectsInvalidRef asserts an unresolvable ref fails fast

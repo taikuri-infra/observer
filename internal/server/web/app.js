@@ -163,6 +163,12 @@
   }
 
   function loadArtifact(tab) {
+    // Invalidate any in-flight /api/graphat map build before we repaint:
+    // refreshMapView() only bumps state.mapGen on map→map transitions, so
+    // switching from a map tab to a NON-map tab (or reloading the same
+    // tab's artifact) would otherwise let a late build's .then() paint a
+    // stale map over this tab's content. Bumping here fences all of them.
+    state.mapGen++;
     els.content.innerHTML = '<p class="empty">Loading&hellip;</p>';
     fetch("/api/artifact?tab=" + encodeURIComponent(tab.name))
       .then(function (r) {
@@ -190,6 +196,15 @@
   function onUpdateClick() {
     var tab = state.activeTab;
     if (!tab) return;
+    // The working tree is about to change (a regenerate, and the user may
+    // have just switched branches), so the client-side per-ref graph cache
+    // and the cached ref list are both potentially stale: a branch that
+    // advanced would otherwise keep serving its old graph, and a
+    // newly-created branch would never appear in the pickers. Drop both;
+    // the per-commit SERVER cache (keyed by SHA, not ref name) stays valid
+    // and remains the real cache.
+    state.graphAtCache = Object.create(null);
+    state.gitRefsPromise = null;
     els.updateBtn.disabled = true;
     els.updateBtn.classList.add("busy");
     els.updateBtn.textContent = "Updating…";
@@ -590,19 +605,34 @@
     "fkOut",
   ];
 
-  // outgoingTargets returns a node id's sorted, de-duplicated outgoing-edge
-  // target ids — the primary structural signal for "changed".
-  function outgoingTargets(edges, id) {
-    var seen = Object.create(null);
-    var out = [];
+  // buildAdjacency returns a from-id -> sorted unique target-id[] map for a
+  // graph's edges, computed in ONE pass. Precomputing this once per graph
+  // turns diffGraphs from O(N·E) (outgoingTargets rescanned every edge per
+  // node) into O(N + E).
+  function buildAdjacency(edges) {
+    var seen = Object.create(null); // from -> { to -> true }
+    var adj = Object.create(null); // from -> [to]
     edges.forEach(function (e) {
-      if (e.from === id && !seen[e.to]) {
-        seen[e.to] = true;
-        out.push(e.to);
+      var s = seen[e.from];
+      if (!s) {
+        s = seen[e.from] = Object.create(null);
+        adj[e.from] = [];
+      }
+      if (!s[e.to]) {
+        s[e.to] = true;
+        adj[e.from].push(e.to);
       }
     });
-    out.sort();
-    return out;
+    Object.keys(adj).forEach(function (from) {
+      adj[from].sort();
+    });
+    return adj;
+  }
+
+  // targetsFor returns a node id's sorted outgoing targets from a prebuilt
+  // adjacency map (empty array when the node has no outgoing edges).
+  function targetsFor(adj, id) {
+    return adj[id] || [];
   }
 
   function sameStringArray(a, b) {
@@ -623,10 +653,8 @@
     return false;
   }
 
-  function nodeStructurallyDiffers(fromNode, toNode, fromEdges, toEdges) {
-    if (
-      !sameStringArray(outgoingTargets(fromEdges, fromNode.id), outgoingTargets(toEdges, toNode.id))
-    ) {
+  function nodeStructurallyDiffers(fromNode, toNode, fromAdj, toAdj) {
+    if (!sameStringArray(targetsFor(fromAdj, fromNode.id), targetsFor(toAdj, toNode.id))) {
       return true;
     }
     return structuralMetricsDiffer(fromNode, toNode);
@@ -638,6 +666,8 @@
   function diffGraphs(fromData, toData) {
     var fromEdges = Array.isArray(fromData.edges) ? fromData.edges : [];
     var toEdges = Array.isArray(toData.edges) ? toData.edges : [];
+    var fromAdj = buildAdjacency(fromEdges);
+    var toAdj = buildAdjacency(toEdges);
     var fromById = Object.create(null);
     (fromData.nodes || []).forEach(function (n) {
       fromById[n.id] = n;
@@ -655,7 +685,7 @@
       if (!prev) {
         status[n.id] = "added";
         added++;
-      } else if (nodeStructurallyDiffers(prev, n, fromEdges, toEdges)) {
+      } else if (nodeStructurallyDiffers(prev, n, fromAdj, toAdj)) {
         status[n.id] = "changed";
         changed++;
       } else {
