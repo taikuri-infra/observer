@@ -13,6 +13,14 @@
     project: null, // { project, tabs, status }
     activeTab: null, // manifest.Tab
     vizInstance: null, // cached Viz.js instance (lazy)
+
+    // ---- git-aware diff overlay ("Compare vs", every map tab) ----
+    gitRefsPromise: null, // shared in-flight/resolved /api/gitrefs fetch
+    gitRefs: null, // { current, branches, tags } once loaded
+    gitBase: "", // "" = overlay off; else the selected ref name — sticky across tab switches
+    gitBaseDefaulted: false, // true once we've auto-picked a default for the Changes tab (never re-auto-pick after that, even if the user then turns it off)
+    gitDiffCache: Object.create(null), // base ref -> Promise<{base,baseResolved,files}>
+    mapGen: 0, // bumped on every renderMap call; async callbacks compare against it to no-op after their tab was torn down
   };
 
   var mermaidCounter = 0;
@@ -456,7 +464,201 @@
     return d;
   }
 
+  // ---- git-aware diff overlay: data loading ----
+  //
+  // /api/gitrefs and /api/gitdiff are plain same-origin GETs (no mutation,
+  // so — like /api/project and /api/artifact — no X-Observer CSRF header
+  // is needed); the browser sends the observer_token cookie automatically.
+
+  function fetchGitRefs() {
+    if (state.gitRefsPromise) return state.gitRefsPromise;
+    state.gitRefsPromise = fetch("/api/gitrefs")
+      .then(function (r) {
+        if (!r.ok) throw new Error("GET /api/gitrefs: " + r.status);
+        return r.json();
+      })
+      .then(function (data) {
+        state.gitRefs = data;
+        return data;
+      })
+      .catch(function (err) {
+        state.gitRefsPromise = null; // allow a retry on the next map render
+        throw err;
+      });
+    return state.gitRefsPromise;
+  }
+
+  function fetchGitDiff(base) {
+    if (!base) return Promise.resolve(null);
+    if (state.gitDiffCache[base]) return state.gitDiffCache[base];
+    var p = fetch("/api/gitdiff?base=" + encodeURIComponent(base))
+      .then(function (r) {
+        if (!r.ok) {
+          return r.text().then(function (body) {
+            throw new Error("GET /api/gitdiff: " + r.status + " " + body);
+          });
+        }
+        return r.json();
+      })
+      .catch(function (err) {
+        delete state.gitDiffCache[base]; // don't cache a failure — allow retry
+        throw err;
+      });
+    state.gitDiffCache[base] = p;
+    return p;
+  }
+
+  // pickDefaultBase picks the ref the "Compare vs" picker should default
+  // to when a map tab wants diff mode on from the start (currently: the
+  // Changes tab) — the repo's "main"/"master" branch if either exists,
+  // else whatever branch is currently checked out, else the first branch
+  // for lack of anything better.
+  function pickDefaultBase(refs) {
+    if (!refs) return "";
+    var branches = refs.branches || [];
+    if (branches.indexOf("main") >= 0) return "main";
+    if (branches.indexOf("master") >= 0) return "master";
+    if (refs.current) return refs.current;
+    return branches[0] || "";
+  }
+
+  // ---- git-aware diff overlay: node classification ----
+  //
+  // Mirrors the generator-side convention (graphmodel.go/callgraphmodel.go)
+  // and splits cleanly on whether a node is FILE-PRECISE:
+  //
+  //  - A "func" node WITH loc.primaryFile (CallGraphModel's go/ast
+  //    enrichment) is classified ONLY by that one file's diff entry — its
+  //    own [lineStart,lineEnd] against that file's hunks. It NEVER falls
+  //    through to the package-directory scan: editing one file in a
+  //    package must not amber-flag every OTHER function in it. A func whose
+  //    own file isn't in the diff is "unchanged", full stop.
+  //
+  //  - Every other node's location.path is a package/migrations DIRECTORY,
+  //    where diffing only ever answers "changed" (if ANY file under it
+  //    changed) — never "added", since a package isn't "added" just because
+  //    the files under it are new.
+  //
+  // A hunk is { start, count, oldCount }: oldCount is how many base-side
+  // lines it replaced. "added" requires PURE-INSERTION hunks (oldCount ===
+  // 0) covering the whole function — a fully-rewritten existing function
+  // has oldCount > 0 and is therefore "changed", not "added".
+
+  function nodeHunks(entry) {
+    return Array.isArray(entry.hunks) ? entry.hunks : [];
+  }
+  function hunkEnd(h) {
+    return h.start + Math.max(h.count, 1) - 1;
+  }
+  function intersectingHunks(start, end, hunks) {
+    return hunks.filter(function (h) {
+      return start <= hunkEnd(h) && end >= h.start;
+    });
+  }
+  function rangeWhollyWithinHunks(start, end, hunks) {
+    // Every line of [start,end] is covered by the union of the hunks.
+    for (var ln = start; ln <= end; ln++) {
+      var covered = hunks.some(function (h) {
+        return ln >= h.start && ln <= hunkEnd(h);
+      });
+      if (!covered) return false;
+    }
+    return true;
+  }
+
+  // classifyFuncByFile is the file-precise path: a func node's own line
+  // range against its own file's hunks.
+  function classifyFuncByFile(loc, entry) {
+    var hunks = nodeHunks(entry);
+    var start = loc.lineStart,
+      end = typeof loc.lineEnd === "number" && loc.lineEnd >= start ? loc.lineEnd : start;
+    if (typeof start !== "number" || start <= 0 || hunks.length === 0) {
+      // No usable line range or no hunk detail — fall back to the file's
+      // own status (a whole new file ⇒ added; a deleted file is out of
+      // scope for "removed" nodes ⇒ unchanged; otherwise changed).
+      if (entry.status === "A") return "added";
+      if (entry.status === "D") return "unchanged";
+      return "changed";
+    }
+    var hit = intersectingHunks(start, end, hunks);
+    if (hit.length === 0) {
+      // The file changed, but not this function's own lines.
+      return entry.status === "A" ? "added" : "unchanged";
+    }
+    var allPureInsertion = hit.every(function (h) {
+      return (h.oldCount || 0) === 0;
+    });
+    if (allPureInsertion && rangeWhollyWithinHunks(start, end, hunks)) return "added";
+    return "changed";
+  }
+
+  // funcPrimaryFile returns a func node's own file when it has one (the
+  // file-precise classification key), else "".
+  function funcPrimaryFile(n) {
+    var loc = n.location || {};
+    return n.kind === "func" && loc.primaryFile ? loc.primaryFile : "";
+  }
+
+  // matchedFilesForNode returns the diff entries a node resolves to, in
+  // the SAME priority classifyForNode uses, so the detail panel shows
+  // exactly what the classification looked at: a file-precise func node ⇒
+  // only its own file (or nothing, if untouched); a directory node ⇒ every
+  // changed file under it.
+  function matchedFilesForNode(n, diffFiles) {
+    if (!diffFiles) return [];
+    var pf = funcPrimaryFile(n);
+    if (pf) {
+      return diffFiles[pf] ? [{ path: pf, entry: diffFiles[pf] }] : [];
+    }
+    var loc = n.location || {};
+    if (loc.path && diffFiles[loc.path]) {
+      return [{ path: loc.path, entry: diffFiles[loc.path] }];
+    }
+    var out = [];
+    if (loc.path) {
+      var prefix = loc.path === "." ? "" : loc.path + "/";
+      Object.keys(diffFiles).forEach(function (p) {
+        if (prefix === "" ? p.indexOf("/") < 0 : p.indexOf(prefix) === 0) {
+          out.push({ path: p, entry: diffFiles[p] });
+        }
+      });
+    }
+    return out;
+  }
+
+  function classifyForNode(n, diffFiles) {
+    if (!diffFiles) return null;
+    var loc = n.location || {};
+    var pf = funcPrimaryFile(n);
+    if (pf) {
+      // File-precise: ONLY this func's own file decides it. Not in the
+      // diff ⇒ unchanged, never a package-directory fall-through.
+      return diffFiles[pf] ? classifyFuncByFile(loc, diffFiles[pf]) : "unchanged";
+    }
+    // Directory node: an exact path hit, else any file under the dir.
+    if (loc.path && diffFiles[loc.path]) {
+      var e = diffFiles[loc.path];
+      if (e.status === "A") return "added";
+      if (e.status === "D") return "unchanged";
+      return "changed";
+    }
+    if (loc.path) {
+      var dirPrefix = loc.path === "." ? "" : loc.path + "/";
+      for (var p in diffFiles) {
+        if (!Object.prototype.hasOwnProperty.call(diffFiles, p)) continue;
+        var underDir = dirPrefix === "" ? p.indexOf("/") < 0 : p.indexOf(dirPrefix) === 0;
+        if (underDir) return "changed";
+      }
+    }
+    return "unchanged";
+  }
+
   function renderMap(text) {
+    // Bumped on every call so the async git-overlay fetches below can
+    // detect "this map tab was replaced before I resolved" and no-op
+    // instead of touching a torn-down DOM.
+    var mapGenAtRender = ++state.mapGen;
+
     var data;
     try {
       data = JSON.parse(text);
@@ -726,6 +928,40 @@
     searchWrap.appendChild(searchLabel);
     searchWrap.appendChild(search);
     rail.appendChild(searchWrap);
+
+    // ---- "Compare vs" git-aware diff overlay (every map tab) ----
+    var isChangesTab = meta.source === "changes";
+    var compareWrap = document.createElement("div");
+    var compareLabel = document.createElement("h4");
+    compareLabel.textContent = "Compare vs";
+    var compareSelect = document.createElement("select");
+    compareSelect.className = "map-select";
+    var offOpt = document.createElement("option");
+    offOpt.value = "";
+    offOpt.textContent = "— off —";
+    compareSelect.appendChild(offOpt);
+    var compareSummary = document.createElement("div");
+    compareSummary.className = "map-compare-summary";
+    var diffLegend = document.createElement("div");
+    diffLegend.className = "map-diff-legend";
+    function diffLegendRow(cls, label) {
+      var row = document.createElement("div");
+      row.className = "map-diff-legend-row";
+      var sw = document.createElement("span");
+      sw.className = "sw " + cls;
+      var lbl = document.createElement("span");
+      lbl.textContent = label;
+      row.appendChild(sw);
+      row.appendChild(lbl);
+      return row;
+    }
+    diffLegend.appendChild(diffLegendRow("added", "Added vs base"));
+    diffLegend.appendChild(diffLegendRow("changed", "Changed vs base"));
+    compareWrap.appendChild(compareLabel);
+    compareWrap.appendChild(compareSelect);
+    compareWrap.appendChild(compareSummary);
+    compareWrap.appendChild(diffLegend);
+    rail.appendChild(compareWrap);
 
     var kindCounts = Object.create(null);
     nodes.forEach(function (n) {
@@ -1210,17 +1446,155 @@
       nodes.forEach(function (n) {
         var g = nodeEls[n.id];
         if (!g) return;
-        g.classList.toggle("map-dim", !nodeVisible(n, q) || changedDim(n));
+        g.classList.toggle("map-dim", !nodeVisible(n, q) || dimByChangeOrDiff(n));
       });
       edgeEls.forEach(function (x) {
         var na = byId[x.a],
           nbNode = byId[x.b];
         var visEdge = na && nbNode && nodeVisible(na, q) && nodeVisible(nbNode, q);
-        var edgeChangedDim = anyChanged && !(na && na.changed) && !(nbNode && nbNode.changed);
-        x.el.classList.toggle("map-dim", !visEdge || edgeChangedDim);
+        x.el.classList.toggle("map-dim", !visEdge || edgeDimByChangeOrDiff(na, nbNode));
       });
     }
     search.addEventListener("input", applyFilters);
+
+    // ---- git-aware diff overlay: wiring ----
+    //
+    // diffState.active flips on once a base ref is selected AND its diff
+    // has actually loaded; diffState.status[id] is then the
+    // classifyForNode result for every node. While active, it SUPERSEDES
+    // the legacy ChangedGraphModel "changed" flag (dimByChangeOrDiff /
+    // edgeDimByChangeOrDiff below) — the two would otherwise disagree
+    // whenever the user picks a base other than main on the Changes tab.
+    var diffState = { active: false, files: null, status: Object.create(null) };
+
+    function nodeIsDiffHot(n) {
+      var st = diffState.status[n.id];
+      return st === "added" || st === "changed";
+    }
+    function dimByChangeOrDiff(n) {
+      if (diffState.active) return !nodeIsDiffHot(n);
+      return changedDim(n);
+    }
+    function edgeDimByChangeOrDiff(na, nb2) {
+      if (diffState.active) {
+        return !((na && nodeIsDiffHot(na)) || (nb2 && nodeIsDiffHot(nb2)));
+      }
+      return anyChanged && !(na && na.changed) && !(nb2 && nb2.changed);
+    }
+
+    function applyDiffClasses() {
+      nodes.forEach(function (n) {
+        var g = nodeEls[n.id];
+        if (!g) return;
+        var st = diffState.active ? diffState.status[n.id] : null;
+        g.classList.toggle("map-diff-added", st === "added");
+        g.classList.toggle("map-diff-changed", st === "changed");
+        // Legacy ChangedGraphModel highlighting is superseded by the
+        // overlay once it's active; fall back to it otherwise (overlay
+        // off, or its data failed to load).
+        g.classList.toggle("map-changed", !diffState.active && !!n.changed);
+      });
+      // The static "N packages changed vs main" banner (meta.source ===
+      // "changes") reflects the artifact's own hardcoded base=main
+      // comparison — once the overlay is active (which carries its own
+      // summary line, possibly against a DIFFERENT base the user picked),
+      // hide it rather than show two numbers that can disagree.
+      if (banner) banner.classList.toggle("map-banner-hidden", diffState.active);
+    }
+
+    function updateCompareSummary() {
+      if (!diffState.active) {
+        compareSummary.textContent = "";
+        return;
+      }
+      var added = 0,
+        changedCount = 0;
+      nodes.forEach(function (n) {
+        var st = diffState.status[n.id];
+        if (st === "added") added++;
+        else if (st === "changed") changedCount++;
+      });
+      compareSummary.textContent =
+        "vs " + state.gitBase + ": " + added + " added · " + changedCount + " changed";
+    }
+
+    function applyCompare() {
+      var base = state.gitBase;
+      var gen = state.mapGen;
+      if (!base) {
+        diffState.active = false;
+        diffState.files = null;
+        diffState.status = Object.create(null);
+        applyDiffClasses();
+        updateCompareSummary();
+        applyFilters();
+        return;
+      }
+      compareSummary.textContent = "loading…";
+      fetchGitDiff(base)
+        .then(function (resp) {
+          if (gen !== state.mapGen || state.gitBase !== base) return; // stale: tab changed, or base changed again mid-flight
+          diffState.active = true;
+          diffState.files = resp.files || {};
+          diffState.status = Object.create(null);
+          nodes.forEach(function (n) {
+            diffState.status[n.id] = classifyForNode(n, diffState.files);
+          });
+          applyDiffClasses();
+          updateCompareSummary();
+          applyFilters();
+        })
+        .catch(function () {
+          if (gen !== state.mapGen || state.gitBase !== base) return;
+          diffState.active = false;
+          compareSummary.textContent = "failed to load diff vs " + base;
+        });
+    }
+
+    compareSelect.addEventListener("change", function () {
+      state.gitBase = compareSelect.value;
+      state.gitBaseDefaulted = true; // the user took control: never auto-default again, even to "off"
+      applyCompare();
+    });
+
+    fetchGitRefs()
+      .then(function (refs) {
+        if (state.mapGen !== mapGenAtRender) return; // stale: another tab was selected before refs loaded
+        // Populate the <select>: off (already present) + branches + tags.
+        function addGroup(label, names) {
+          if (!names || names.length === 0) return;
+          var group = document.createElement("optgroup");
+          group.label = label;
+          names.forEach(function (name) {
+            var opt = document.createElement("option");
+            opt.value = name;
+            opt.textContent = name;
+            group.appendChild(opt);
+          });
+          compareSelect.appendChild(group);
+        }
+        addGroup("Branches", refs.branches);
+        addGroup("Tags", refs.tags);
+
+        if (!state.gitBaseDefaulted && isChangesTab) {
+          state.gitBase = pickDefaultBase(refs);
+          state.gitBaseDefaulted = true;
+        }
+        // A previously-selected ref might no longer exist (deleted
+        // branch, different repo) — fall back to off rather than asking
+        // the server for a ref it can't resolve.
+        var known = (refs.branches || []).concat(refs.tags || []);
+        if (state.gitBase && known.indexOf(state.gitBase) < 0) {
+          state.gitBase = "";
+        }
+        compareSelect.value = state.gitBase || "";
+        applyCompare();
+      })
+      .catch(function () {
+        if (state.mapGen !== mapGenAtRender) return;
+        compareSelect.disabled = true;
+        compareSummary.textContent = "git refs unavailable";
+      });
 
     // ---- hover metric card ----
     function showCard(n) {
@@ -1468,8 +1842,47 @@
         pb.appendChild(colSec);
       }
 
-      // Changed files (only for nodes flagged by gen.ChangedGraphModel)
-      if (n.changed) {
+      // Git diff vs the selected base ref (the overlay) when active;
+      // otherwise fall back to the legacy ChangedGraphModel flag.
+      if (diffState.active) {
+        var gitSec = document.createElement("div");
+        gitSec.className = "map-psec";
+        var gitH = document.createElement("h5");
+        gitH.textContent = "Git diff vs " + state.gitBase;
+        gitSec.appendChild(gitH);
+        var st = diffState.status[n.id] || "unchanged";
+        var badge = document.createElement("span");
+        badge.className = "map-tag map-diff-badge-" + st;
+        badge.textContent = st === "added" ? "Added" : st === "changed" ? "Changed" : "Unchanged";
+        gitSec.appendChild(badge);
+        var matches = matchedFilesForNode(n, diffState.files);
+        if (matches.length > 0) {
+          var fileList = document.createElement("ul");
+          fileList.className = "map-changed-files";
+          matches.forEach(function (m) {
+            var li = document.createElement("li");
+            var text = m.path + " [" + m.entry.status + "]";
+            if (
+              n.kind === "func" &&
+              typeof loc.lineStart === "number" &&
+              loc.lineStart > 0 &&
+              Array.isArray(m.entry.hunks) &&
+              m.entry.hunks.length > 0
+            ) {
+              text += " — function lines " + loc.lineStart + "-" + loc.lineEnd;
+            }
+            li.textContent = text;
+            fileList.appendChild(li);
+          });
+          gitSec.appendChild(fileList);
+        } else {
+          var noMatch = document.createElement("div");
+          noMatch.className = "map-empty-doc";
+          noMatch.textContent = "No tracked file changes match this node vs " + state.gitBase + ".";
+          gitSec.appendChild(noMatch);
+        }
+        pb.appendChild(gitSec);
+      } else if (n.changed) {
         var chSec = document.createElement("div");
         chSec.className = "map-psec";
         var chFiles = Array.isArray(n.changedFiles) ? n.changedFiles : [];

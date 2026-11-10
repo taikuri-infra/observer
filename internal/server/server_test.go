@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +10,15 @@ import (
 	"strings"
 	"testing"
 )
+
+func run(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	c := exec.Command("git", args...)
+	c.Dir = dir
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v %s", args, err, out)
+	}
+}
 
 // testToken is the fixed API bearer token used across tests (production
 // generates one randomly via crypto/rand — see cmd/observer).
@@ -250,6 +260,151 @@ func TestWebAssetServesJS(t *testing.T) {
 	}
 	if rec.Body.Len() == 0 {
 		t.Fatal("expected non-empty app.js body")
+	}
+}
+
+// TestGitRefsListsBranchesAndTags proves GET /api/gitrefs reflects the
+// repo's real branches/tags/current branch, and is token-gated like every
+// other /api/* route.
+func TestGitRefsListsBranchesAndTags(t *testing.T) {
+	repo := initRepo(t)
+	writeManifest(t, repo)
+	run(t, repo, "tag", "v1.0.0")
+	run(t, repo, "branch", "feature")
+	h := New(repo, "main", testToken)
+
+	r := req(http.MethodGet, "/api/gitrefs")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: expected 401, got %d", rec.Code)
+	}
+
+	r = req(http.MethodGet, "/api/gitrefs")
+	r.Header.Set("X-Observer-Token", testToken)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("gitrefs status = %d body=%s", rec.Code, rec.Body)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"current":"main"`) {
+		t.Errorf("gitrefs body missing current branch: %s", body)
+	}
+	if !strings.Contains(body, "feature") {
+		t.Errorf("gitrefs body missing feature branch: %s", body)
+	}
+	if !strings.Contains(body, "v1.0.0") {
+		t.Errorf("gitrefs body missing v1.0.0 tag: %s", body)
+	}
+}
+
+// TestGitDiffRejectsBogusRef proves a ?base= that doesn't resolve to a
+// commit 400s rather than silently producing an empty/wrong diff.
+func TestGitDiffRejectsBogusRef(t *testing.T) {
+	repo := initRepo(t)
+	writeManifest(t, repo)
+	h := New(repo, "main", testToken)
+
+	r := req(http.MethodGet, "/api/gitdiff?base=does-not-exist-anywhere")
+	r.Header.Set("X-Observer-Token", testToken)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bogus base ref: expected 400, got %d body=%s", rec.Code, rec.Body)
+	}
+}
+
+// TestGitDiffRejectsOptionLikeRef proves an option-looking ?base= (a flag
+// injection attempt) is rejected with 400 before any git call.
+func TestGitDiffRejectsOptionLikeRef(t *testing.T) {
+	repo := initRepo(t)
+	writeManifest(t, repo)
+	h := New(repo, "main", testToken)
+
+	for _, bad := range []string{"--output=/tmp/x", "-q"} {
+		r := req(http.MethodGet, "/api/gitdiff?base="+bad)
+		r.Header.Set("X-Observer-Token", testToken)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("option-like base %q: expected 400, got %d body=%s", bad, rec.Code, rec.Body)
+		}
+	}
+}
+
+// TestGitDiffRequiresToken locks in that /api/gitdiff is token-gated like
+// every other /api/* route (the review flagged that only /api/gitrefs had
+// an explicit auth test).
+func TestGitDiffRequiresToken(t *testing.T) {
+	repo := initRepo(t)
+	writeManifest(t, repo)
+	h := New(repo, "main", testToken)
+
+	r := req(http.MethodGet, "/api/gitdiff?base=main")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: expected 401, got %d body=%s", rec.Code, rec.Body)
+	}
+}
+
+// TestGitDiffReturnsFileStatuses exercises the real flow: a feature branch
+// adds a file and modifies another relative to main; GET
+// /api/gitdiff?base=main must report both with the right status.
+func TestGitDiffReturnsFileStatuses(t *testing.T) {
+	repo := initRepo(t)
+	writeManifest(t, repo)
+	if err := os.WriteFile(filepath.Join(repo, "keep.go"), []byte("package x\n\nfunc A() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo, "add", "-A")
+	run(t, repo, "commit", "-q", "-m", "add keep.go")
+
+	run(t, repo, "checkout", "-q", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(repo, "new.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "keep.go"), []byte("package x\n\nfunc A() {}\n\nfunc B() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo, "add", "-A")
+	run(t, repo, "commit", "-q", "-m", "feature: add new.go, touch keep.go")
+
+	h := New(repo, "main", testToken)
+	r := req(http.MethodGet, "/api/gitdiff?base=main")
+	r.Header.Set("X-Observer-Token", testToken)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("gitdiff status = %d body=%s", rec.Code, rec.Body)
+	}
+
+	var resp struct {
+		Base         string `json:"base"`
+		BaseResolved string `json:"baseResolved"`
+		Files        map[string]struct {
+			Status string `json:"status"`
+			Hunks  []struct {
+				Start    int `json:"start"`
+				Count    int `json:"count"`
+				OldCount int `json:"oldCount"`
+			} `json:"hunks"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode gitdiff response: %v body=%s", err, rec.Body)
+	}
+	if resp.Base != "main" || resp.BaseResolved == "" {
+		t.Fatalf("resp = %+v", resp)
+	}
+	newFile, ok := resp.Files["new.go"]
+	if !ok || newFile.Status != "A" {
+		t.Fatalf("new.go = %+v, want status A", newFile)
+	}
+	keepFile, ok := resp.Files["keep.go"]
+	if !ok || keepFile.Status != "M" {
+		t.Fatalf("keep.go = %+v, want status M", keepFile)
 	}
 }
 

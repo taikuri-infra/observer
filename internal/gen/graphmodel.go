@@ -61,6 +61,16 @@ type GraphLocation struct {
 	Path        string `json:"path"`
 	PrimaryFile string `json:"primaryFile,omitempty"`
 	Files       int    `json:"files"`
+	// LineStart/LineEnd are only populated for "func" nodes whose exact
+	// declaration CallGraphModel could resolve via go/ast (see funcloc.go):
+	// the 1-based [LineStart,LineEnd] span of the function/method
+	// declaration inside PrimaryFile, from the `func` keyword through its
+	// closing brace. omitempty keeps them out of every node that doesn't
+	// have file:line precision (package/table/module-level nodes, and any
+	// call-graph func this repo couldn't resolve — closures, third-party
+	// functions, or an AST id mismatch).
+	LineStart int `json:"lineStart,omitempty"`
+	LineEnd   int `json:"lineEnd,omitempty"`
 }
 
 // GraphDescription.Source is one of "godoc" | "jsdoc" | "observer-annotation" | "none".
@@ -119,7 +129,9 @@ type GraphEdge struct {
 }
 
 // goListDepsPkg is the subset of `go list -json -deps` fields GraphModel
-// needs per package.
+// needs per package. Error is only populated under `go list -e` (see
+// funcloc.go's listModulePackages): a package that failed to load still
+// gets emitted, with the failure here, instead of aborting the whole list.
 type goListDepsPkg struct {
 	ImportPath   string
 	Dir          string
@@ -127,6 +139,13 @@ type goListDepsPkg struct {
 	GoFiles      []string
 	TestGoFiles  []string
 	XTestGoFiles []string
+	Error        *goListPkgError
+}
+
+// goListPkgError is `go list`'s per-package Error object (only its message
+// matters here).
+type goListPkgError struct {
+	Err string
 }
 
 // GraphModel builds the normalized graph.json for moduleDir's own Go

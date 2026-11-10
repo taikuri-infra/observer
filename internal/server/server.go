@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/taikuri-infra/observer/internal/gitmeta"
 	"github.com/taikuri-infra/observer/internal/manifest"
 	"github.com/taikuri-infra/observer/internal/runner"
 )
@@ -61,6 +62,8 @@ func New(repo, base, token string) http.Handler {
 	mux.HandleFunc("/api/project", s.requireToken(s.handleProject))
 	mux.HandleFunc("/api/update", s.requireToken(s.handleUpdate))
 	mux.HandleFunc("/api/artifact", s.requireToken(s.handleArtifact))
+	mux.HandleFunc("/api/gitrefs", s.requireToken(s.handleGitRefs))
+	mux.HandleFunc("/api/gitdiff", s.requireToken(s.handleGitDiff))
 	mux.HandleFunc("/web/", s.handleWebAsset)
 	mux.HandleFunc("/", s.handleIndex)
 	// Wrap every route with a Host allowlist so a DNS-rebinding page (an
@@ -358,6 +361,85 @@ func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", contentTypeFor(tab.Renderer))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+// gitRefsResponse is GET /api/gitrefs's body: the data the dashboard's
+// "Compare vs" base-ref picker (every map tab, not just Changes) needs to
+// populate itself — current branch (for defaulting) plus every local
+// branch and tag.
+type gitRefsResponse struct {
+	Current  string   `json:"current"`
+	Branches []string `json:"branches"`
+	Tags     []string `json:"tags"`
+}
+
+// handleGitRefs serves GET /api/gitrefs: s.repo's current branch, local
+// branches, and tags, straight from gitmeta.ListRefs. Read-only, so (like
+// /api/project and /api/artifact) it doesn't require the X-Observer CSRF
+// header — only R15's mutating POST /api/update does.
+func (s *Server) handleGitRefs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	current, branches, tags, err := gitmeta.ListRefs(s.repo)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, gitRefsResponse{Current: current, Branches: branches, Tags: tags})
+}
+
+// gitDiffResponse is GET /api/gitdiff's body: base as given, the commit it
+// actually resolved to (baseResolved), and every file that differs between
+// HEAD and base's merge-base, keyed by repo-relative path — the data the
+// git-aware overlay classifies every map node's added/changed/unchanged
+// status from (see app.js's classifyForNode).
+type gitDiffResponse struct {
+	Base         string                      `json:"base"`
+	BaseResolved string                      `json:"baseResolved"`
+	Files        map[string]gitmeta.DiffFile `json:"files"`
+}
+
+// handleGitDiff serves GET /api/gitdiff?base=<ref>: validates base with
+// gitmeta.VerifyRef FIRST, which also rejects (before any git call) a base
+// that isn't a valid ref name or begins with "-" — so an option-looking
+// ref like "--output=/tmp/x" or "-q" can never reach git as a flag — then
+// --end-of-options + ^{commit}-verifies it resolves to a real commit.
+// Everything downstream diffs against the RESOLVED hash, never the raw
+// ref. A base that fails any of that is a 400; a base that's valid but has
+// no merge-base with the working tree (doesn't exist in this history, or
+// genuinely unrelated) degrades to an empty file set rather than an error,
+// matching Changes/ChangedGraphModel's own tolerance for that case.
+func (s *Server) handleGitDiff(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	base := r.URL.Query().Get("base")
+	if base == "" {
+		http.Error(w, "missing required ?base= query param", http.StatusBadRequest)
+		return
+	}
+	baseResolved, err := gitmeta.VerifyRef(s.repo, base)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid base ref %q: does not resolve to a commit", base), http.StatusBadRequest)
+		return
+	}
+	// Diff against the RESOLVED hash, never the raw user-supplied base —
+	// VerifyRef already confirmed baseResolved is a real commit, so no git
+	// call downstream re-parses attacker-controlled ref text.
+	mergeBase, err := gitmeta.MergeBase(s.repo, baseResolved, "HEAD")
+	if err != nil || mergeBase == "" {
+		writeJSON(w, http.StatusOK, gitDiffResponse{Base: base, BaseResolved: baseResolved, Files: map[string]gitmeta.DiffFile{}})
+		return
+	}
+	files, err := gitmeta.DiffAgainst(s.repo, mergeBase)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, gitDiffResponse{Base: base, BaseResolved: baseResolved, Files: files})
 }
 
 func contentTypeFor(renderer string) string {
