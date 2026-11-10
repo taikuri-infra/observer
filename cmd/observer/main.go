@@ -62,15 +62,19 @@ func usage() {
 
 Usage:
   observer serve [--repo .] [--base main] [--addr 127.0.0.1] [--port 7979]
+  observer gen apiroutes --dir <moduleDir> --out <routes.json> [--repo .]
   observer gen callgraphmodel --dir <moduleDir> --main <mainPkgDir> --out <graph.json> [--repo .]
   observer gen changes --base main --out <path> [--repo .]
   observer gen changedgraph --dir <moduleDir> --base main --out <graph.json> [--repo .]
+  observer gen contextpack --dir <moduleDir> --out <context.md> [--repo .] [--base main]
   observer gen er --migrations <dir> --out <er.mmd> --dbml-out <er.dbml> [--json-out <graph.json>] [--repo .]
   observer gen frontendmodel --dir <pkgDir> --src <subdir> --out <graph.json> [--repo .]
   observer gen godeps --dir <moduleDir> --out <godeps.dot> [--repo .]
   observer gen graphmodel --dir <moduleDir> --out <graph.json> [--repo .]
   observer gen hotspots --out <hotspots.json> [--repo .] [--since <ref>]
   observer gen overview --out <index.md> [--repo .] [--base main]
+  observer gen todos --out <todos.json> [--repo .] [--top <n>]
+  observer gen whatchanged --base main --out <path> [--repo .]
   observer init [--repo .] [--out <path>]
   observer doctor [--repo .]
   observer version
@@ -128,12 +132,16 @@ func runGen(args []string) error {
 		return fmt.Errorf("gen: missing generator name (changes)")
 	}
 	switch args[0] {
+	case "apiroutes":
+		return runGenAPIRoutes(args[1:])
 	case "callgraphmodel":
 		return runGenCallGraphModel(args[1:])
 	case "changes":
 		return runGenChanges(args[1:])
 	case "changedgraph":
 		return runGenChangedGraph(args[1:])
+	case "contextpack":
+		return runGenContextPack(args[1:])
 	case "er":
 		return runGenER(args[1:])
 	case "frontendmodel":
@@ -146,9 +154,47 @@ func runGen(args []string) error {
 		return runGenHotspots(args[1:])
 	case "overview":
 		return runGenOverview(args[1:])
+	case "todos":
+		return runGenTODOs(args[1:])
+	case "whatchanged":
+		return runGenWhatChanged(args[1:])
 	default:
-		return fmt.Errorf("gen: unknown generator %q (available: callgraphmodel, changes, changedgraph, er, frontendmodel, godeps, graphmodel, hotspots, overview)", args[0])
+		return fmt.Errorf("gen: unknown generator %q (available: apiroutes, callgraphmodel, changes, changedgraph, contextpack, er, frontendmodel, godeps, graphmodel, hotspots, overview, todos, whatchanged)", args[0])
 	}
+}
+
+// runGenAPIRoutes wires gen.APIRoutes: --dir is the Go module directory
+// (relative to --repo unless absolute, same resolution as gen graphmodel/
+// godeps), --out is where the routes.json array is written. --repo is used
+// only to make each route's File repo-relative.
+func runGenAPIRoutes(args []string) error {
+	fs := flag.NewFlagSet("gen apiroutes", flag.ExitOnError)
+	repo := fs.String("repo", ".", "path to the repo")
+	dir := fs.String("dir", ".", "path to the Go module directory (relative to --repo unless absolute)")
+	out := fs.String("out", "", "output file path (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("gen apiroutes: --out is required")
+	}
+	absRepo, err := absPath(*repo)
+	if err != nil {
+		return err
+	}
+	absDir := *dir
+	if !filepath.IsAbs(absDir) {
+		absDir = filepath.Join(absRepo, absDir)
+	}
+	routes, err := gen.APIRoutes(absRepo, absDir)
+	if err != nil {
+		return fmt.Errorf("gen apiroutes: %w", err)
+	}
+	b, err := json.MarshalIndent(routes, "", "  ")
+	if err != nil {
+		return fmt.Errorf("gen apiroutes: marshal: %w", err)
+	}
+	return writeOut(absRepo, *out, string(b))
 }
 
 // runGenCallGraphModel wires gen.CallGraphModel: --dir is the Go module
@@ -212,6 +258,31 @@ func runGenChanges(args []string) error {
 	md, err := gen.Changes(absRepo, *base)
 	if err != nil {
 		return fmt.Errorf("gen changes: %w", err)
+	}
+	return writeOut(absRepo, *out, md)
+}
+
+// runGenWhatChanged wires gen.WhatChanged: the "What changed" tab's
+// AI-reviewer-oriented Markdown digest, textual complement to the
+// highlighted-map "Changes" tab (runGenChanges/runGenChangedGraph above).
+func runGenWhatChanged(args []string) error {
+	fs := flag.NewFlagSet("gen whatchanged", flag.ExitOnError)
+	repo := fs.String("repo", ".", "path to the repo")
+	base := fs.String("base", "main", "branch to compare against")
+	out := fs.String("out", "", "output file path (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("gen whatchanged: --out is required")
+	}
+	absRepo, err := absPath(*repo)
+	if err != nil {
+		return err
+	}
+	md, err := gen.WhatChanged(absRepo, *base)
+	if err != nil {
+		return fmt.Errorf("gen whatchanged: %w", err)
 	}
 	return writeOut(absRepo, *out, md)
 }
@@ -344,6 +415,37 @@ func runGenChangedGraph(args []string) error {
 	return writeOut(absRepo, *out, string(b))
 }
 
+// runGenContextPack wires gen.ContextPack: --dir is the Go module directory
+// (relative to --repo unless absolute, same resolution as gen graphmodel/
+// godeps), --base frames the brief's "recent activity" language, --out is
+// where the Markdown brief is written.
+func runGenContextPack(args []string) error {
+	fs := flag.NewFlagSet("gen contextpack", flag.ExitOnError)
+	repo := fs.String("repo", ".", "path to the repo")
+	dir := fs.String("dir", ".", "path to the Go module directory (relative to --repo unless absolute)")
+	base := fs.String("base", "main", "branch to frame recent-activity language against")
+	out := fs.String("out", "", "output file path (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("gen contextpack: --out is required")
+	}
+	absRepo, err := absPath(*repo)
+	if err != nil {
+		return err
+	}
+	absDir := *dir
+	if !filepath.IsAbs(absDir) {
+		absDir = filepath.Join(absRepo, absDir)
+	}
+	md, err := gen.ContextPack(absRepo, absDir, *base)
+	if err != nil {
+		return fmt.Errorf("gen contextpack: %w", err)
+	}
+	return writeOut(absRepo, *out, md)
+}
+
 // runGenGoDeps wires gen.GoDeps: --dir is the Go module directory (relative
 // to --repo unless absolute), --out is where the DOT graph is written.
 func runGenGoDeps(args []string) error {
@@ -459,6 +561,34 @@ func runGenOverview(args []string) error {
 		return fmt.Errorf("gen overview: %w", err)
 	}
 	return writeOut(absRepo, *out, md)
+}
+
+// runGenTODOs wires gen.TODOs: scans repoDir's git-tracked source files for
+// TODO/FIXME/HACK/XXX/BUG marker comments and writes them as JSON.
+func runGenTODOs(args []string) error {
+	fs := flag.NewFlagSet("gen todos", flag.ExitOnError)
+	repo := fs.String("repo", ".", "path to the repo")
+	top := fs.Int("top", 0, "max number of markers to report (0 = unlimited)")
+	out := fs.String("out", "", "output file path (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("gen todos: --out is required")
+	}
+	absRepo, err := absPath(*repo)
+	if err != nil {
+		return err
+	}
+	markers, err := gen.TODOs(absRepo, *top)
+	if err != nil {
+		return fmt.Errorf("gen todos: %w", err)
+	}
+	b, err := json.MarshalIndent(markers, "", "  ")
+	if err != nil {
+		return fmt.Errorf("gen todos: marshal: %w", err)
+	}
+	return writeOut(absRepo, *out, string(b))
 }
 
 func writeOut(repo, out, content string) error {

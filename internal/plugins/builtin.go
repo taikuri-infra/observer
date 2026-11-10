@@ -31,40 +31,43 @@ func filterSafeRel(paths []string) []string {
 	return out
 }
 
-// DefaultTabs detects repo's structure and returns observer's built-in tab
-// set: Overview, Service map + Changes (always; Service map replaces the
-// old Go deps tab and sits 2nd, right after Overview), Database (per
-// detected SQL migrations dir, also canvas-rendered), Call graph (per
-// detected Go *main package*, also canvas-rendered — see goCallGraphTabs),
-// Frontend deps (per detected frontend package, also canvas-rendered), and
-// Hotspots (always).
+// DefaultTabs detects repo's structure and returns observer's built-in,
+// deliberately LEAN tab set, highest-signal first: Overview, AI context (a
+// paste-ready repo brief), Service map (Go package dependency map, with a
+// churn↔coverage color overlay), Changes (the map with packages differing
+// vs base highlighted), What changed (a textual review digest), API routes
+// (Fiber route table, per Fiber module), Database (ER canvas, per
+// migrations dir), TODOs (marker scan), and Hotspots (churn).
+//
+// Intentionally NOT emitted (removed 2026-11): the per-main-package "Call
+// graph" tabs and the per-frontend-package "Frontend deps" tabs. A
+// function-level call graph for a whole binary is a dense hairball that
+// rarely answers a question the package Service map doesn't already answer
+// at a readable altitude, and both fanned out to one tab per main/app and
+// needed go-callvis/depcruise installed or the tab just errored — pure
+// sidebar clutter. The gen callgraphmodel / gen frontendmodel generators
+// stay in the CLI for anyone who wants to run one by hand.
 //
 // Module detection walks repo up to depth 3 (skipping node_modules/vendor/
-// .git) for nested go.mod/package.json files. Migrations directories and
-// main packages are then searched for within each detected Go module's own
-// subtree (any depth — e.g. servicePlus's tenant_migrations lives 4 levels
-// under its services/api Go module, and that same module has four
-// "package main" directories: cmd/server, cmd/retention-sweeper, and two
-// scripts/ one-shot tools).
+// .git) for nested go.mod files. Migrations directories are then searched
+// for within each detected Go module's own subtree (any depth — e.g.
+// servicePlus's tenant_migrations lives 4 levels under its services/api Go
+// module).
 func DefaultTabs(repo string) ([]manifest.Tab, error) {
 	goModules, err := findModuleDirs(repo, "go.mod", 3)
 	if err != nil {
 		return nil, fmt.Errorf("detect go modules: %w", err)
 	}
-	frontendModules, err := findModuleDirs(repo, "package.json", 3)
-	if err != nil {
-		return nil, fmt.Errorf("detect frontend packages: %w", err)
-	}
-	frontendModules = excludeTestDirs(frontendModules)
 	goModules = filterSafeRel(goModules)
-	frontendModules = filterSafeRel(frontendModules)
 
-	// Service map is the 2nd sidebar tab — right after Overview, before
-	// Changes — so the canvas map is the first thing anyone clicks into
-	// after the landing page.
+	// Service map is the primary canvas tab, right after Overview + the AI
+	// context brief.
 	tabs := []manifest.Tab{overviewTab()}
+	tabs = append(tabs, contextPackTab(goModules)...)
 	tabs = append(tabs, serviceMapTabs(goModules)...)
 	tabs = append(tabs, changesTab(goModules))
+	tabs = append(tabs, whatChangedTab())
+	tabs = append(tabs, apiRoutesTabs(repo, goModules)...)
 
 	var migrationsDirs []string
 	for _, mod := range goModules {
@@ -80,37 +83,10 @@ func DefaultTabs(repo string) ([]manifest.Tab, error) {
 	migrationsDirs = filterSafeRel(migrationsDirs)
 
 	tabs = append(tabs, databaseTabs(migrationsDirs)...)
-	callGraphTabs, err := goCallGraphTabs(repo, goModules)
-	if err != nil {
-		return nil, fmt.Errorf("detect go main packages: %w", err)
-	}
-	tabs = append(tabs, callGraphTabs...)
-	tabs = append(tabs, frontendDepsTabs(repo, frontendModules)...)
+	tabs = append(tabs, todosTab())
 	tabs = append(tabs, hotspotsTab())
 
 	return tabs, nil
-}
-
-// excludeTestDirs drops frontend package dirs that look like test tooling
-// (e2e suites, scenario fixtures) rather than an actual app whose
-// dependency graph is worth visualizing.
-func excludeTestDirs(dirs []string) []string {
-	var out []string
-	for _, d := range dirs {
-		segments := strings.Split(strings.ToLower(filepath.ToSlash(d)), "/")
-		excluded := false
-		for _, seg := range segments {
-			if strings.Contains(seg, "test") || seg == "e2e" {
-				excluded = true
-				break
-			}
-		}
-		if excluded {
-			continue
-		}
-		out = append(out, d)
-	}
-	return out
 }
 
 func overviewTab() manifest.Tab {
@@ -121,6 +97,28 @@ func overviewTab() manifest.Tab {
 		Output:   "index.md",
 		Renderer: "markdown",
 	}
+}
+
+// contextPackTab is the "AI context" tab (native, `observer gen
+// contextpack`): a paste-ready Markdown brief of the whole repo for
+// dropping into an LLM prompt. Sits right after Overview — the 2nd sidebar
+// tab — since it's the first thing a developer reaches for when handing a
+// repo to an AI assistant. Only emitted when at least one Go module was
+// detected (the brief's architecture/data-model/API sections all need a Go
+// module to analyze); the first detected module is used, matching
+// serviceMapTabs/apiRoutesTabs for repos with more than one.
+func contextPackTab(goModules []string) []manifest.Tab {
+	if len(goModules) == 0 {
+		return nil
+	}
+	mod := goModules[0]
+	return []manifest.Tab{{
+		Name:     "AI context",
+		Kind:     manifest.KindGenerator,
+		Command:  fmt.Sprintf("observer gen contextpack --dir '%s' --out obs-data/context.md", mod),
+		Output:   "context.md",
+		Renderer: "markdown",
+	}}
 }
 
 // changesTab is the "Changes" tab: on a repo with at least one detected Go
@@ -152,6 +150,59 @@ func changesTab(goModules []string) manifest.Tab {
 	}
 }
 
+// whatChangedTab is the "What changed" tab: a Markdown review digest
+// (gen.WhatChanged, via `observer gen whatchanged`) — the textual
+// complement to the "Changes" tab's highlighted service map, oriented for
+// pasting into an AI reviewer or a PR description. Always emitted,
+// regardless of detected modules (it degrades gracefully with no Go
+// module, same as the markdown fallback of changesTab).
+func whatChangedTab() manifest.Tab {
+	return manifest.Tab{
+		Name:     "What changed",
+		Kind:     manifest.KindGenerator,
+		Command:  "observer gen whatchanged --base main --out obs-data/whatchanged.md",
+		Output:   "whatchanged.md",
+		Renderer: "markdown",
+	}
+}
+
+// apiRoutesTabs is native (observer gen apiroutes) — one per detected Go
+// module whose go.mod imports gofiber/fiber. No Dir is set: apiroutes'
+// --dir is a repo-root-relative command-line flag, so the command runs
+// from the repo root and passes --dir itself (matching serviceMapTabs).
+func apiRoutesTabs(repo string, goModules []string) []manifest.Tab {
+	var fiberModules []string
+	for _, mod := range goModules {
+		if moduleImportsFiber(filepath.Join(repo, mod)) {
+			fiberModules = append(fiberModules, mod)
+		}
+	}
+
+	var tabs []manifest.Tab
+	for _, mod := range fiberModules {
+		out := outputName("api-routes.json", mod, len(fiberModules))
+		tabs = append(tabs, manifest.Tab{
+			Name:     tabName("API routes", mod, len(fiberModules)),
+			Kind:     manifest.KindGenerator,
+			Command:  fmt.Sprintf("observer gen apiroutes --dir '%s' --out 'obs-data/%s'", mod, out),
+			Output:   out,
+			Renderer: "table",
+		})
+	}
+	return tabs
+}
+
+// moduleImportsFiber reports whether moduleDir's go.mod requires
+// gofiber/fiber (any major version) — the signal that its routes are worth
+// statically parsing for the API routes tab.
+func moduleImportsFiber(moduleDir string) bool {
+	b, err := os.ReadFile(filepath.Join(moduleDir, "go.mod"))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(b), "gofiber/fiber")
+}
+
 // databaseTabs renders the ER model on the canvas map (tables as "table"
 // nodes, foreign keys as edges) via `observer gen er --json-out`, which
 // reuses the same CREATE TABLE parse that also writes the mermaid/DBML
@@ -176,77 +227,6 @@ func databaseTabs(migrationsDirs []string) []manifest.Tab {
 	return tabs
 }
 
-// mainPkgRef pairs a detected "package main" directory with the Go module
-// it lives under, both repo-relative — goCallGraphTabs' unit of work (one
-// tab per mainPkgRef, never per module: see its doc comment for why).
-type mainPkgRef struct {
-	mod string
-	dir string // the main package's directory, relative to mod
-}
-
-// goCallGraphTabs replaces the old graphviz-SVG "Go call graph" pipeline
-// (go-callvis -format svg -file ... ./...), which erred with "found
-// multiple packages with name: main" on any module with more than one main
-// (e.g. servicePlus's services/api: cmd/server, cmd/retention-sweeper, and
-// two scripts/ tools). It emits one renderer:"map" tab PER DETECTED MAIN
-// PACKAGE instead of per module — `observer gen callgraphmodel --dir <mod>
-// --main <mainDir>` targets exactly one main, which is both how the
-// multi-main error is avoided and how the call graph ends up on the canvas
-// map renderer like every other tab (service map, database, frontend
-// deps) rather than a static graphviz SVG.
-//
-// No Dir is set on the tab (same reasoning as serviceMapTabs/
-// frontendDepsTabs): gen callgraphmodel's --dir/--main are repo-root-
-// relative command-line flags, so the command runs from the repo root.
-func goCallGraphTabs(repo string, goModules []string) ([]manifest.Tab, error) {
-	var mains []mainPkgRef
-	for _, mod := range goModules {
-		found, err := findMainPackageDirs(filepath.Join(repo, mod))
-		if err != nil {
-			return nil, fmt.Errorf("detect main packages under %s: %w", mod, err)
-		}
-		found = filterSafeRel(found)
-		for _, d := range found {
-			mains = append(mains, mainPkgRef{mod: mod, dir: d})
-		}
-	}
-
-	// When more than one module contributes mains, disambiguate the tab
-	// NAME and OUTPUT by the main's FULL repo-relative path (module + main
-	// dir), not just its module-relative dir: two modules can each have a
-	// "cmd/server" main (services/api/cmd/server + services/worker/cmd/
-	// server), which — keyed on "cmd/server" alone — would collide to one
-	// output file (last write wins) AND one duplicate tab name (breaking
-	// /api/artifact?tab= lookup). Within a single module, main dirs are
-	// already unique, so the shorter module-relative dir is kept.
-	modSet := map[string]bool{}
-	for _, m := range mains {
-		modSet[m.mod] = true
-	}
-	multiModule := len(modSet) > 1
-
-	var tabs []manifest.Tab
-	for _, m := range mains {
-		key := m.dir
-		if multiModule {
-			key = filepath.ToSlash(filepath.Join(m.mod, m.dir))
-		}
-		out := outputName("callgraph-map.json", key, len(mains))
-		tabs = append(tabs, manifest.Tab{
-			Name: tabName("Call graph", key, len(mains)),
-			Kind: manifest.KindGenerator,
-			Command: fmt.Sprintf(
-				"observer gen callgraphmodel --dir '%s' --main '%s' --out 'obs-data/%s'",
-				m.mod, m.dir, out,
-			),
-			Output:   out,
-			Renderer: "map",
-			Requires: []string{"go-callvis"},
-		})
-	}
-	return tabs, nil
-}
-
 // serviceMapTabs is native (observer gen graphmodel) — one per detected Go
 // module; it replaces the old DOT-rendered "Go deps" tab. No Dir is set:
 // graphmodel needs the true repo root (to anchor obs-data/hotspots.json and
@@ -267,31 +247,17 @@ func serviceMapTabs(goModules []string) []manifest.Tab {
 	return tabs
 }
 
-// frontendDepsTabs uses the external dependency-cruiser tool (via `observer
-// gen frontendmodel`, which shells out to it and parses its JSON output into
-// a graph.json) — one per detected frontend package. Scans the package's
-// "src" dir when present, else the whole package dir. Unlike the old DOT
-// pipeline, no Dir is set: frontendmodel needs the true repo root to
-// compute each node's repo-relative location.path, so the command runs from
-// the repo root and passes --dir itself (matching serviceMapTabs).
-func frontendDepsTabs(repo string, frontendModules []string) []manifest.Tab {
-	var tabs []manifest.Tab
-	for _, mod := range frontendModules {
-		src := "src"
-		if _, err := os.Stat(filepath.Join(repo, mod, "src")); err != nil {
-			src = "."
-		}
-		out := outputName("frontend-map.json", mod, len(frontendModules))
-		tabs = append(tabs, manifest.Tab{
-			Name:     tabName("Frontend deps", mod, len(frontendModules)),
-			Kind:     manifest.KindGenerator,
-			Command:  fmt.Sprintf("observer gen frontendmodel --dir '%s' --src '%s' --out 'obs-data/%s'", mod, src, out),
-			Output:   out,
-			Renderer: "map",
-			Requires: []string{"depcruise"},
-		})
+// todosTab is native (observer gen todos) — always emitted, every repo:
+// scans git-tracked source files for TODO/FIXME/HACK/XXX/BUG marker
+// comments and renders them as a flat table.
+func todosTab() manifest.Tab {
+	return manifest.Tab{
+		Name:     "TODOs",
+		Kind:     manifest.KindGenerator,
+		Command:  "observer gen todos --out obs-data/todos.json",
+		Output:   "todos.json",
+		Renderer: "table",
 	}
-	return tabs
 }
 
 func hotspotsTab() manifest.Tab {
