@@ -3,6 +3,7 @@
 package gitmeta
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -62,8 +63,70 @@ func Collect(dir, base string) (Meta, error) {
 		return m, err
 	}
 	m.Head = head
-	m.MergeBase, _ = git(dir, "merge-base", base, "HEAD")
+	m.MergeBase, _ = MergeBase(dir, base, "HEAD")
 	status, _ := git(dir, "status", "--porcelain")
 	m.Dirty = status != ""
 	return m, nil
+}
+
+// MergeBase returns the merge-base commit of base and head in dir's repo —
+// the common ancestor every "changes since base" comparison (Changes,
+// ChangedGraphModel, DiffAgainst) actually diffs HEAD against, not base
+// itself. An empty result with a nil error means no common ancestor was
+// found (base doesn't exist locally, or the two histories are unrelated);
+// callers that need a hard requirement should treat that themselves, the
+// same way Collect's own callers already tolerate it.
+func MergeBase(dir, base, head string) (string, error) {
+	out, err := git(dir, "merge-base", base, head)
+	if err != nil {
+		return "", nil
+	}
+	return out, nil
+}
+
+// VerifyRef resolves ref to its commit hash, confirming it actually names
+// a commit (branch, tag, or any other commit-ish) that exists in dir's
+// repo. It's the validation gate GET /api/gitdiff runs before using a
+// caller-supplied ref for anything else: git rev-parse never shells out to
+// interpret ref (Command execs git with an argv array, so ref is always a
+// single argument, never shell-expanded), but resolving it up front means
+// a bogus ref is rejected with a clear 400 instead of silently feeding an
+// empty/wrong diff downstream.
+func VerifyRef(dir, ref string) (commit string, err error) {
+	out, err := git(dir, "rev-parse", "--verify", ref+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("ref %q does not resolve to a commit: %w", ref, err)
+	}
+	return out, nil
+}
+
+// ListRefs returns dir's local branches and tags (short names, e.g.
+// "main", "v1.2.3"), each sorted by git's own for-each-ref default order,
+// plus the current branch (empty when HEAD is detached). Used by GET
+// /api/gitrefs to populate the git-aware overlay's base-ref picker.
+func ListRefs(dir string) (current string, branches []string, tags []string, err error) {
+	current, _ = git(dir, "rev-parse", "--abbrev-ref", "HEAD")
+	if current == "HEAD" {
+		current = "" // detached HEAD: no "current branch" to default to
+	}
+	branchOut, err := git(dir, "for-each-ref", "--format=%(refname:short)", "refs/heads/")
+	if err != nil {
+		return current, nil, nil, fmt.Errorf("list branches: %w", err)
+	}
+	tagOut, err := git(dir, "for-each-ref", "--format=%(refname:short)", "refs/tags/")
+	if err != nil {
+		return current, nil, nil, fmt.Errorf("list tags: %w", err)
+	}
+	return current, splitNonEmptyLines(branchOut), splitNonEmptyLines(tagOut), nil
+}
+
+func splitNonEmptyLines(s string) []string {
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
 }

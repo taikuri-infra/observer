@@ -368,5 +368,17 @@ func CallGraphModel(moduleDir, mainPkg string) (*Graph, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gen callgraphmodel: read go-callvis dot output: %w", err)
 	}
-	return ParseCallGraphDOT(dotBytes, modulePath)
+	g, err := ParseCallGraphDOT(dotBytes, modulePath)
+	if err != nil {
+		return nil, err
+	}
+	// Enrich every "func" node with its real file + line range (go/ast,
+	// not go-callvis's own DOT — see funcloc.go's doc comment for why DOT
+	// alone can't give us this). Best-effort per node (unresolved nodes
+	// just keep their package-only location, same as before this
+	// enrichment existed); only a hard `go list` failure propagates.
+	if _, err := enrichCallGraphLocations(g, moduleDir); err != nil {
+		return nil, fmt.Errorf("enrich call graph locations: %w", err)
+	}
+	return g, nil
 }

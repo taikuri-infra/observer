@@ -61,6 +61,16 @@ type GraphLocation struct {
 	Path        string `json:"path"`
 	PrimaryFile string `json:"primaryFile,omitempty"`
 	Files       int    `json:"files"`
+	// LineStart/LineEnd are only populated for "func" nodes whose exact
+	// declaration CallGraphModel could resolve via go/ast (see funcloc.go):
+	// the 1-based [LineStart,LineEnd] span of the function/method
+	// declaration inside PrimaryFile, from the `func` keyword through its
+	// closing brace. omitempty keeps them out of every node that doesn't
+	// have file:line precision (package/table/module-level nodes, and any
+	// call-graph func this repo couldn't resolve — closures, third-party
+	// functions, or an AST id mismatch).
+	LineStart int `json:"lineStart,omitempty"`
+	LineEnd   int `json:"lineEnd,omitempty"`
 }
 
 // GraphDescription.Source is one of "godoc" | "jsdoc" | "observer-annotation" | "none".
