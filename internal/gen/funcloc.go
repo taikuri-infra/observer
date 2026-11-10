@@ -36,26 +36,33 @@ type funcIndex struct {
 	byPkgName map[string]funcLoc
 }
 
-// listModulePackages runs `go list -json -deps ./...` in moduleDir and
-// returns every package *within the module itself* (stdlib/third-party
-// deps are dropped — their source isn't something buildFuncIndex needs to
-// walk, and go-callvis's own location comment already notes third-party
-// call-graph nodes keep their full import path as location.path, never
-// file:line), keyed by full import path.
+// listModulePackages runs `go list -e -json ./...` in moduleDir and
+// returns every package *within the module itself*, keyed by full import
+// path. Two deliberate choices harden it against a partially-broken repo:
+//   - `-e` (and NOT `-deps`): without -e, a single unbuildable package
+//     anywhere under the module fails the whole list and so the whole call
+//     graph's location enrichment; with -e, broken packages are emitted
+//     with a populated .Error instead, and we simply skip them (their
+//     func nodes stay package-only, same as an unresolved node always
+//     has). Dropping -deps is safe because buildFuncIndex only ever walks
+//     the module's own packages anyway (stdlib/third-party source is never
+//     indexed — go-callvis's own location comment notes those nodes keep
+//     their full import path, never file:line), so `./...` alone is the
+//     exact set we want.
 func listModulePackages(moduleDir string) (map[string]goListDepsPkg, error) {
 	modulePath, err := readModulePath(moduleDir)
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.Command("go", "list", "-json", "-deps", "./...")
+	cmd := exec.Command("go", "list", "-e", "-json", "./...")
 	cmd.Dir = moduleDir
 	cmd.Env = append(os.Environ(), "GO111MODULE=on")
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("go list -json -deps ./... in %s: %w\n%s", moduleDir, err, ee.Stderr)
+			return nil, fmt.Errorf("go list -e -json ./... in %s: %w\n%s", moduleDir, err, ee.Stderr)
 		}
-		return nil, fmt.Errorf("go list -json -deps ./... in %s: %w", moduleDir, err)
+		return nil, fmt.Errorf("go list -e -json ./... in %s: %w", moduleDir, err)
 	}
 	pkgs := map[string]goListDepsPkg{}
 	dec := json.NewDecoder(strings.NewReader(string(out)))
@@ -65,6 +72,12 @@ func listModulePackages(moduleDir string) (map[string]goListDepsPkg, error) {
 			return nil, fmt.Errorf("decode go list output: %w", err)
 		}
 		if !underModule(p.ImportPath, modulePath) {
+			continue
+		}
+		// A package that failed to load (-e) has no reliable Dir/GoFiles to
+		// walk — skip it rather than letting one broken package abort the
+		// whole index; its functions just stay unresolved.
+		if p.Error != nil && p.Error.Err != "" {
 			continue
 		}
 		pkgs[p.ImportPath] = p

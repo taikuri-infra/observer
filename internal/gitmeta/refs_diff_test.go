@@ -119,8 +119,12 @@ func TestDiffAgainst(t *testing.T) {
 	if newFile.Status != "A" {
 		t.Errorf("new.go status = %q, want A", newFile.Status)
 	}
-	if len(newFile.Hunks) != 1 || newFile.Hunks[0][0] != 1 || newFile.Hunks[0][1] != 3 {
-		t.Errorf("new.go hunks = %v, want [[1 3]]", newFile.Hunks)
+	if len(newFile.Hunks) != 1 || newFile.Hunks[0].Start != 1 || newFile.Hunks[0].Count != 3 {
+		t.Errorf("new.go hunks = %+v, want [{1 3 0}]", newFile.Hunks)
+	}
+	// A brand-new file is a pure insertion: oldCount 0.
+	if newFile.Hunks[0].OldCount != 0 {
+		t.Errorf("new.go hunk oldCount = %d, want 0", newFile.Hunks[0].OldCount)
 	}
 
 	keepFile, ok := files["keep.go"]
@@ -131,9 +135,199 @@ func TestDiffAgainst(t *testing.T) {
 		t.Errorf("keep.go status = %q, want M", keepFile.Status)
 	}
 	// The appended blank line + "func C() {}" landed at lines 6-7 of the
-	// new content, two lines added.
-	if len(keepFile.Hunks) != 1 || keepFile.Hunks[0][0] != 6 || keepFile.Hunks[0][1] != 2 {
-		t.Errorf("keep.go hunks = %v, want [[6 2]]", keepFile.Hunks)
+	// new content, two lines added, nothing removed (oldCount 0).
+	if len(keepFile.Hunks) != 1 || keepFile.Hunks[0].Start != 6 || keepFile.Hunks[0].Count != 2 {
+		t.Errorf("keep.go hunks = %+v, want [{6 2 0}]", keepFile.Hunks)
+	}
+	if keepFile.Hunks[0].OldCount != 0 {
+		t.Errorf("keep.go hunk oldCount = %d, want 0 (pure append)", keepFile.Hunks[0].OldCount)
+	}
+}
+
+// TestDiffAgainstRewriteCarriesOldCount proves a line REPLACED in place
+// (not appended) reports a non-zero oldCount — the signal app.js uses to
+// class a rewritten existing function "changed", not "added".
+func TestDiffAgainstRewriteCarriesOldCount(t *testing.T) {
+	dir := initRepo(t)
+	writeFile(t, filepath.Join(dir, "k.go"), "package x\n\nfunc A() { return }\n")
+	run(t, dir, "add", "-A")
+	run(t, dir, "commit", "-q", "-m", "base")
+	run(t, dir, "branch", "base-point")
+
+	// Replace the body line in place (same line count, different content).
+	writeFile(t, filepath.Join(dir, "k.go"), "package x\n\nfunc A() { panic(1) }\n")
+	run(t, dir, "add", "-A")
+	run(t, dir, "commit", "-q", "-m", "rewrite A's body")
+
+	mergeBase, err := MergeBase(dir, "base-point", "HEAD")
+	if err != nil {
+		t.Fatalf("MergeBase: %v", err)
+	}
+	files, err := DiffAgainst(dir, mergeBase)
+	if err != nil {
+		t.Fatalf("DiffAgainst: %v", err)
+	}
+	k := files["k.go"]
+	if len(k.Hunks) != 1 {
+		t.Fatalf("k.go hunks = %+v, want exactly one", k.Hunks)
+	}
+	if k.Hunks[0].OldCount == 0 {
+		t.Errorf("rewrite hunk oldCount = 0, want > 0 (a line was replaced, not purely inserted)")
+	}
+}
+
+// TestDiffAgainstRename proves a rename (`git diff --name-status` reports
+// "R100\told\tnew") collapses to status "M" at the DESTINATION path.
+func TestDiffAgainstRename(t *testing.T) {
+	dir := initRepo(t)
+	writeFile(t, filepath.Join(dir, "old.go"), "package x\n\nfunc A() {}\n")
+	run(t, dir, "add", "-A")
+	run(t, dir, "commit", "-q", "-m", "add old.go")
+	run(t, dir, "branch", "base-point")
+
+	run(t, dir, "mv", "old.go", "new.go")
+	run(t, dir, "commit", "-q", "-m", "rename old.go to new.go")
+
+	mergeBase, err := MergeBase(dir, "base-point", "HEAD")
+	if err != nil {
+		t.Fatalf("MergeBase: %v", err)
+	}
+	// Force rename detection so --name-status yields an R-status line.
+	files, err := DiffAgainst(dir, mergeBase)
+	if err != nil {
+		t.Fatalf("DiffAgainst: %v", err)
+	}
+	newFile, ok := files["new.go"]
+	if !ok {
+		t.Fatalf("rename destination new.go missing: %+v", files)
+	}
+	if newFile.Status != "M" {
+		t.Errorf("rename new.go status = %q, want M", newFile.Status)
+	}
+	if _, ok := files["old.go"]; ok {
+		t.Errorf("rename source old.go should not appear as its own entry: %+v", files)
+	}
+}
+
+// TestDiffAgainstUntrackedFile proves a brand-new, uncommitted,
+// not-ignored file shows up as a synthetic add (status "A") even though it
+// isn't in any commit — so its nodes classify "added", not "unchanged".
+func TestDiffAgainstUntrackedFile(t *testing.T) {
+	dir := initRepo(t)
+	run(t, dir, "branch", "base-point")
+	writeFile(t, filepath.Join(dir, "untracked.go"), "package x\n\nfunc U() {}\n")
+
+	mergeBase, err := MergeBase(dir, "base-point", "HEAD")
+	if err != nil {
+		t.Fatalf("MergeBase: %v", err)
+	}
+	files, err := DiffAgainst(dir, mergeBase)
+	if err != nil {
+		t.Fatalf("DiffAgainst: %v", err)
+	}
+	u, ok := files["untracked.go"]
+	if !ok {
+		t.Fatalf("untracked.go missing from diff: %+v", files)
+	}
+	if u.Status != "A" {
+		t.Errorf("untracked.go status = %q, want A", u.Status)
+	}
+}
+
+// TestDiffAgainstUnicodePath proves a non-ASCII filename appears literally
+// (not octal-escaped) in the diff — the -c core.quotepath=false hardening
+// (gitmeta.go Command) at work; without it git would emit "p\303\244iv\303\244.go".
+func TestDiffAgainstUnicodePath(t *testing.T) {
+	dir := initRepo(t)
+	run(t, dir, "branch", "base-point")
+	writeFile(t, filepath.Join(dir, "päivä.go"), "package x\n\nfunc P() {}\n")
+	run(t, dir, "add", "-A")
+	run(t, dir, "commit", "-q", "-m", "add unicode-named file")
+
+	mergeBase, err := MergeBase(dir, "base-point", "HEAD")
+	if err != nil {
+		t.Fatalf("MergeBase: %v", err)
+	}
+	files, err := DiffAgainst(dir, mergeBase)
+	if err != nil {
+		t.Fatalf("DiffAgainst: %v", err)
+	}
+	if _, ok := files["päivä.go"]; !ok {
+		t.Fatalf("unicode path päivä.go missing (quotepath not disabled?): %+v", files)
+	}
+}
+
+// TestDiffAgainstIgnoresRepoLocalDiffExternal is the RCE regression test:
+// a mounted repo whose .git/config sets diff.external to a program that
+// proves it ran (by touching a marker) must NEVER have that program
+// invoked when the overlay diffs it — the -c diff.external= hardening
+// (gitmeta.go Command) plus --no-ext-diff (diff.go) close this.
+func TestDiffAgainstIgnoresRepoLocalDiffExternal(t *testing.T) {
+	dir := initRepo(t)
+	writeFile(t, filepath.Join(dir, "f.go"), "package x\n\nfunc A() {}\n")
+	run(t, dir, "add", "-A")
+	run(t, dir, "commit", "-q", "-m", "base")
+	run(t, dir, "branch", "base-point")
+	writeFile(t, filepath.Join(dir, "f.go"), "package x\n\nfunc A() { _ = 1 }\n")
+	run(t, dir, "add", "-A")
+	run(t, dir, "commit", "-q", "-m", "touch f.go")
+
+	marker := filepath.Join(dir, "pwned")
+	evil := filepath.Join(dir, "evil-diff.sh")
+	if err := os.WriteFile(evil, []byte("#!/bin/sh\ntouch "+marker+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A repo-local diff.external points at the malicious program — exactly
+	// what an attacker ships in a mounted repo's .git/config.
+	cfg := exec.Command("git", "config", "--local", "diff.external", evil)
+	cfg.Dir = dir
+	if out, err := cfg.CombinedOutput(); err != nil {
+		t.Fatalf("git config diff.external: %v %s", err, out)
+	}
+
+	mergeBase, err := MergeBase(dir, "base-point", "HEAD")
+	if err != nil {
+		t.Fatalf("MergeBase: %v", err)
+	}
+	if _, err := DiffAgainst(dir, mergeBase); err != nil {
+		t.Fatalf("DiffAgainst: %v", err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("malicious diff.external driver ran despite -c diff.external= / --no-ext-diff")
+	} else if !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
+// TestParseHunkHeaderBareCount covers a hunk header with a bare "+N" (no
+// comma) — unified diff's convention for a one-line count.
+func TestParseHunkHeaderBareCount(t *testing.T) {
+	h, ok := parseHunkHeader("@@ -4 +7 @@ func C() {}")
+	if !ok {
+		t.Fatal("expected parse to succeed")
+	}
+	if h.Start != 7 || h.Count != 1 || h.OldCount != 1 {
+		t.Fatalf("bare-count hunk = %+v, want {7 1 1}", h)
+	}
+
+	h2, ok := parseHunkHeader("@@ -0,0 +1,3 @@")
+	if !ok {
+		t.Fatal("expected parse to succeed")
+	}
+	if h2.Start != 1 || h2.Count != 3 || h2.OldCount != 0 {
+		t.Fatalf("insertion hunk = %+v, want {1 3 0}", h2)
+	}
+}
+
+// TestVerifyRefRejectsOptionLikeRef proves an option-looking base
+// ("--output=/tmp/x", "-q") is rejected by the allowlist BEFORE any git
+// call, so it can never reach git as a flag.
+func TestVerifyRefRejectsOptionLikeRef(t *testing.T) {
+	dir := initRepo(t)
+	for _, bad := range []string{"--output=/tmp/x", "-q", "--upload-pack=touch /tmp/pwn", "../etc", "a b", ""} {
+		if _, err := VerifyRef(dir, bad); err == nil {
+			t.Errorf("VerifyRef(%q) = nil error, want rejection", bad)
+		}
 	}
 }
 
@@ -165,6 +359,6 @@ func TestDiffAgainstNoHunksForDeletedFile(t *testing.T) {
 		t.Errorf("gone.go status = %q, want D", gone.Status)
 	}
 	if len(gone.Hunks) != 0 {
-		t.Errorf("gone.go hunks = %v, want none", gone.Hunks)
+		t.Errorf("gone.go hunks = %+v, want none", gone.Hunks)
 	}
 }

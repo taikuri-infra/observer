@@ -315,6 +315,40 @@ func TestGitDiffRejectsBogusRef(t *testing.T) {
 	}
 }
 
+// TestGitDiffRejectsOptionLikeRef proves an option-looking ?base= (a flag
+// injection attempt) is rejected with 400 before any git call.
+func TestGitDiffRejectsOptionLikeRef(t *testing.T) {
+	repo := initRepo(t)
+	writeManifest(t, repo)
+	h := New(repo, "main", testToken)
+
+	for _, bad := range []string{"--output=/tmp/x", "-q"} {
+		r := req(http.MethodGet, "/api/gitdiff?base="+bad)
+		r.Header.Set("X-Observer-Token", testToken)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("option-like base %q: expected 400, got %d body=%s", bad, rec.Code, rec.Body)
+		}
+	}
+}
+
+// TestGitDiffRequiresToken locks in that /api/gitdiff is token-gated like
+// every other /api/* route (the review flagged that only /api/gitrefs had
+// an explicit auth test).
+func TestGitDiffRequiresToken(t *testing.T) {
+	repo := initRepo(t)
+	writeManifest(t, repo)
+	h := New(repo, "main", testToken)
+
+	r := req(http.MethodGet, "/api/gitdiff?base=main")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: expected 401, got %d body=%s", rec.Code, rec.Body)
+	}
+}
+
 // TestGitDiffReturnsFileStatuses exercises the real flow: a feature branch
 // adds a file and modifies another relative to main; GET
 // /api/gitdiff?base=main must report both with the right status.
@@ -350,8 +384,12 @@ func TestGitDiffReturnsFileStatuses(t *testing.T) {
 		Base         string `json:"base"`
 		BaseResolved string `json:"baseResolved"`
 		Files        map[string]struct {
-			Status string  `json:"status"`
-			Hunks  [][]int `json:"hunks"`
+			Status string `json:"status"`
+			Hunks  []struct {
+				Start    int `json:"start"`
+				Count    int `json:"count"`
+				OldCount int `json:"oldCount"`
+			} `json:"hunks"`
 		} `json:"files"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {

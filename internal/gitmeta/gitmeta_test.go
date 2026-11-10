@@ -53,6 +53,10 @@ func TestCommandHardensArgsAndEnv(t *testing.T) {
 		"-c", "core.hooksPath=/dev/null",
 		"-c", "core.fsmonitor=false",
 		"-c", "protocol.ext.allow=never",
+		"-c", "diff.external=",
+		"-c", "core.quotepath=false",
+		"-c", "diff.noprefix=false",
+		"-c", "diff.mnemonicPrefix=false",
 		"status", "--porcelain",
 	}
 	if strings.Join(cmd.Args, " ") != strings.Join(want, " ") {

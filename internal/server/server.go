@@ -402,13 +402,15 @@ type gitDiffResponse struct {
 }
 
 // handleGitDiff serves GET /api/gitdiff?base=<ref>: validates base with
-// gitmeta.VerifyRef FIRST (defense in depth — base is passed to git as a
-// single argv element, never shell-interpolated, but rejecting a ref that
-// doesn't resolve to a commit with a clear 400 is better than silently
-// diffing against nothing), then diffs HEAD against base's merge-base. No
-// merge-base (base doesn't exist locally, or genuinely unrelated history)
-// degrades to an empty file set rather than an error, matching
-// Changes/ChangedGraphModel's own tolerance for that case.
+// gitmeta.VerifyRef FIRST, which also rejects (before any git call) a base
+// that isn't a valid ref name or begins with "-" — so an option-looking
+// ref like "--output=/tmp/x" or "-q" can never reach git as a flag — then
+// --end-of-options + ^{commit}-verifies it resolves to a real commit.
+// Everything downstream diffs against the RESOLVED hash, never the raw
+// ref. A base that fails any of that is a 400; a base that's valid but has
+// no merge-base with the working tree (doesn't exist in this history, or
+// genuinely unrelated) degrades to an empty file set rather than an error,
+// matching Changes/ChangedGraphModel's own tolerance for that case.
 func (s *Server) handleGitDiff(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -424,7 +426,10 @@ func (s *Server) handleGitDiff(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("invalid base ref %q: does not resolve to a commit", base), http.StatusBadRequest)
 		return
 	}
-	mergeBase, err := gitmeta.MergeBase(s.repo, base, "HEAD")
+	// Diff against the RESOLVED hash, never the raw user-supplied base —
+	// VerifyRef already confirmed baseResolved is a real commit, so no git
+	// call downstream re-parses attacker-controlled ref text.
+	mergeBase, err := gitmeta.MergeBase(s.repo, baseResolved, "HEAD")
 	if err != nil || mergeBase == "" {
 		writeJSON(w, http.StatusOK, gitDiffResponse{Base: base, BaseResolved: baseResolved, Files: map[string]gitmeta.DiffFile{}})
 		return

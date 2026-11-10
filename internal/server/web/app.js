@@ -524,55 +524,93 @@
 
   // ---- git-aware diff overlay: node classification ----
   //
-  // Mirrors the generator-side convention (graphmodel.go/callgraphmodel.go):
-  // most nodes' location.path is a package/migrations DIRECTORY, where
-  // diffing only ever answers "changed" (if any file under it changed) —
-  // never "added", since a package isn't "added" just because every file
-  // under it happens to be new. Only "func" nodes carry a file-precise
-  // location (primaryFile + lineStart/lineEnd, from CallGraphModel's
-  // go/ast enrichment), which is where "added" and function-precise
-  // "changed" come from.
+  // Mirrors the generator-side convention (graphmodel.go/callgraphmodel.go)
+  // and splits cleanly on whether a node is FILE-PRECISE:
+  //
+  //  - A "func" node WITH loc.primaryFile (CallGraphModel's go/ast
+  //    enrichment) is classified ONLY by that one file's diff entry — its
+  //    own [lineStart,lineEnd] against that file's hunks. It NEVER falls
+  //    through to the package-directory scan: editing one file in a
+  //    package must not amber-flag every OTHER function in it. A func whose
+  //    own file isn't in the diff is "unchanged", full stop.
+  //
+  //  - Every other node's location.path is a package/migrations DIRECTORY,
+  //    where diffing only ever answers "changed" (if ANY file under it
+  //    changed) — never "added", since a package isn't "added" just because
+  //    the files under it are new.
+  //
+  // A hunk is { start, count, oldCount }: oldCount is how many base-side
+  // lines it replaced. "added" requires PURE-INSERTION hunks (oldCount ===
+  // 0) covering the whole function — a fully-rewritten existing function
+  // has oldCount > 0 and is therefore "changed", not "added".
 
+  function nodeHunks(entry) {
+    return Array.isArray(entry.hunks) ? entry.hunks : [];
+  }
+  function hunkEnd(h) {
+    return h.start + Math.max(h.count, 1) - 1;
+  }
+  function intersectingHunks(start, end, hunks) {
+    return hunks.filter(function (h) {
+      return start <= hunkEnd(h) && end >= h.start;
+    });
+  }
   function rangeWhollyWithinHunks(start, end, hunks) {
-    return hunks.some(function (h) {
-      return start >= h[0] && end <= h[0] + h[1] - 1;
-    });
-  }
-  function rangeIntersectsHunks(start, end, hunks) {
-    return hunks.some(function (h) {
-      var hs = h[0],
-        he = h[0] + h[1] - 1;
-      return start <= he && end >= hs;
-    });
+    // Every line of [start,end] is covered by the union of the hunks.
+    for (var ln = start; ln <= end; ln++) {
+      var covered = hunks.some(function (h) {
+        return ln >= h.start && ln <= hunkEnd(h);
+      });
+      if (!covered) return false;
+    }
+    return true;
   }
 
-  // classifyFileEntry classifies a node that matched exactly one tracked
-  // file (entry): func nodes with a line range get added/changed/unchanged
-  // precision from entry.hunks; everything else (and a func with no hunk
-  // data) falls back to the file's own status.
-  function classifyFileEntry(n, loc, entry) {
-    var hunks = Array.isArray(entry.hunks) ? entry.hunks : [];
-    if (n.kind === "func" && typeof loc.lineStart === "number" && loc.lineStart > 0 && hunks.length > 0) {
-      if (rangeWhollyWithinHunks(loc.lineStart, loc.lineEnd, hunks)) return "added";
-      if (rangeIntersectsHunks(loc.lineStart, loc.lineEnd, hunks)) return "changed";
-      return entry.status === "A" ? "added" : "unchanged"; // file touched elsewhere; this function's own lines weren't
+  // classifyFuncByFile is the file-precise path: a func node's own line
+  // range against its own file's hunks.
+  function classifyFuncByFile(loc, entry) {
+    var hunks = nodeHunks(entry);
+    var start = loc.lineStart,
+      end = typeof loc.lineEnd === "number" && loc.lineEnd >= start ? loc.lineEnd : start;
+    if (typeof start !== "number" || start <= 0 || hunks.length === 0) {
+      // No usable line range or no hunk detail — fall back to the file's
+      // own status (a whole new file ⇒ added; a deleted file is out of
+      // scope for "removed" nodes ⇒ unchanged; otherwise changed).
+      if (entry.status === "A") return "added";
+      if (entry.status === "D") return "unchanged";
+      return "changed";
     }
-    if (entry.status === "A") return "added";
-    if (entry.status === "D") return "unchanged"; // removed nodes are out of scope (see task note: needs the base-ref graph, a later tier)
+    var hit = intersectingHunks(start, end, hunks);
+    if (hit.length === 0) {
+      // The file changed, but not this function's own lines.
+      return entry.status === "A" ? "added" : "unchanged";
+    }
+    var allPureInsertion = hit.every(function (h) {
+      return (h.oldCount || 0) === 0;
+    });
+    if (allPureInsertion && rangeWhollyWithinHunks(start, end, hunks)) return "added";
     return "changed";
   }
 
+  // funcPrimaryFile returns a func node's own file when it has one (the
+  // file-precise classification key), else "".
+  function funcPrimaryFile(n) {
+    var loc = n.location || {};
+    return n.kind === "func" && loc.primaryFile ? loc.primaryFile : "";
+  }
+
   // matchedFilesForNode returns the diff entries a node resolves to, in
-  // the same priority classifyForNode uses: a func node's own primaryFile
-  // first, then an exact path match, then every file under a directory
-  // path. Shared with the detail panel so it can show exactly what
-  // classifyForNode looked at.
+  // the SAME priority classifyForNode uses, so the detail panel shows
+  // exactly what the classification looked at: a file-precise func node ⇒
+  // only its own file (or nothing, if untouched); a directory node ⇒ every
+  // changed file under it.
   function matchedFilesForNode(n, diffFiles) {
     if (!diffFiles) return [];
-    var loc = n.location || {};
-    if (n.kind === "func" && loc.primaryFile && diffFiles[loc.primaryFile]) {
-      return [{ path: loc.primaryFile, entry: diffFiles[loc.primaryFile] }];
+    var pf = funcPrimaryFile(n);
+    if (pf) {
+      return diffFiles[pf] ? [{ path: pf, entry: diffFiles[pf] }] : [];
     }
+    var loc = n.location || {};
     if (loc.path && diffFiles[loc.path]) {
       return [{ path: loc.path, entry: diffFiles[loc.path] }];
     }
@@ -591,17 +629,24 @@
   function classifyForNode(n, diffFiles) {
     if (!diffFiles) return null;
     var loc = n.location || {};
-    if (n.kind === "func" && loc.primaryFile && diffFiles[loc.primaryFile]) {
-      return classifyFileEntry(n, loc, diffFiles[loc.primaryFile]);
+    var pf = funcPrimaryFile(n);
+    if (pf) {
+      // File-precise: ONLY this func's own file decides it. Not in the
+      // diff ⇒ unchanged, never a package-directory fall-through.
+      return diffFiles[pf] ? classifyFuncByFile(loc, diffFiles[pf]) : "unchanged";
     }
+    // Directory node: an exact path hit, else any file under the dir.
     if (loc.path && diffFiles[loc.path]) {
-      return classifyFileEntry(n, loc, diffFiles[loc.path]);
+      var e = diffFiles[loc.path];
+      if (e.status === "A") return "added";
+      if (e.status === "D") return "unchanged";
+      return "changed";
     }
     if (loc.path) {
-      var prefix = loc.path === "." ? "" : loc.path + "/";
+      var dirPrefix = loc.path === "." ? "" : loc.path + "/";
       for (var p in diffFiles) {
         if (!Object.prototype.hasOwnProperty.call(diffFiles, p)) continue;
-        var underDir = prefix === "" ? p.indexOf("/") < 0 : p.indexOf(prefix) === 0;
+        var underDir = dirPrefix === "" ? p.indexOf("/") < 0 : p.indexOf(dirPrefix) === 0;
         if (underDir) return "changed";
       }
     }

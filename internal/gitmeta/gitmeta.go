@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 )
 
@@ -25,16 +26,31 @@ type Meta struct {
 //
 // Every git exec in this codebase must go through Command, never
 // exec.Command("git", ...) directly: it prefixes every invocation with
-// -c flags that disable hooks/fsmonitor/the ext protocol, and sets the
-// process env so neither a global nor system gitconfig (which, combined
-// with a malicious repo-local include, could still inject settings) nor an
-// interactive credential prompt can apply.
+// -c flags that disable hooks/fsmonitor/the ext protocol, neutralize any
+// repo-configured external diff driver, and pin path quoting/prefix
+// behavior, then sets the process env so neither a global nor system
+// gitconfig (which, combined with a malicious repo-local include, could
+// still inject settings) nor an interactive credential prompt can apply.
+//
+// diff.external= is a second RCE sink beyond hooks: `git diff` in a mounted
+// repo whose .git/config sets diff.external (or a per-driver
+// diff.<name>.command keyed from .gitattributes) would otherwise run that
+// program on every hunk the moment a user opens the diff overlay. Clearing
+// it here (plus --no-ext-diff on the diff calls themselves, belt and
+// braces) closes that. core.quotepath=false keeps non-ASCII paths literal
+// (not \NNN-escaped) so the overlay can match them; diff.noprefix=false /
+// diff.mnemonicPrefix=false pin the "a/"/"b/" prefixes diff.go's hunk
+// parser relies on, against a repo that reconfigured them.
 func Command(dir string, args ...string) *exec.Cmd {
-	hardened := make([]string, 0, len(args)+6)
+	hardened := make([]string, 0, len(args)+16)
 	hardened = append(hardened,
 		"-c", "core.hooksPath=/dev/null",
 		"-c", "core.fsmonitor=false",
 		"-c", "protocol.ext.allow=never",
+		"-c", "diff.external=",
+		"-c", "core.quotepath=false",
+		"-c", "diff.noprefix=false",
+		"-c", "diff.mnemonicPrefix=false",
 	)
 	hardened = append(hardened, args...)
 	c := exec.Command("git", hardened...)
@@ -84,16 +100,30 @@ func MergeBase(dir, base, head string) (string, error) {
 	return out, nil
 }
 
+// safeRefRe allowlists exactly the characters a legitimate branch/tag/ref
+// name (plus the "^{commit}" peel suffix and "~"/"^" ancestry ops) uses.
+// It is the FIRST gate VerifyRef applies, before any git call: git execs
+// via an argv array so a ref is never shell-expanded, but a ref that
+// starts with "-" would still be parsed by rev-parse as an OPTION, not an
+// operand (e.g. "--output=/tmp/x", "-q") — this rejects that class
+// outright rather than relying solely on --end-of-options.
+var safeRefRe = regexp.MustCompile(`^[A-Za-z0-9._/@^~{}-]+$`)
+
 // VerifyRef resolves ref to its commit hash, confirming it actually names
 // a commit (branch, tag, or any other commit-ish) that exists in dir's
 // repo. It's the validation gate GET /api/gitdiff runs before using a
-// caller-supplied ref for anything else: git rev-parse never shells out to
-// interpret ref (Command execs git with an argv array, so ref is always a
-// single argument, never shell-expanded), but resolving it up front means
-// a bogus ref is rejected with a clear 400 instead of silently feeding an
-// empty/wrong diff downstream.
+// caller-supplied ref for anything else. Defense in depth, three layers:
+// (1) reject a ref that isn't in safeRefRe, or that begins with "-", so an
+// option-looking ref never reaches git as a flag; (2) pass
+// --end-of-options so even a future allowlist gap can't make git treat the
+// ref as an option; (3) --verify ... ^{commit} so it must resolve to a
+// real commit. Callers should then diff against the RETURNED hash, never
+// the raw ref, so no git call downstream re-parses attacker text.
 func VerifyRef(dir, ref string) (commit string, err error) {
-	out, err := git(dir, "rev-parse", "--verify", ref+"^{commit}")
+	if ref == "" || strings.HasPrefix(ref, "-") || !safeRefRe.MatchString(ref) {
+		return "", fmt.Errorf("ref %q is not a valid ref name", ref)
+	}
+	out, err := git(dir, "rev-parse", "--verify", "--end-of-options", ref+"^{commit}")
 	if err != nil {
 		return "", fmt.Errorf("ref %q does not resolve to a commit: %w", ref, err)
 	}
