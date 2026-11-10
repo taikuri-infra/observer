@@ -406,6 +406,7 @@
     columns: "columns",
     fkIn: "foreign keys in",
     fkOut: "foreign keys out",
+    coverage: "test coverage (static proxy)",
   };
   function mapMetricLabel(key) {
     return MAP_METRIC_LABEL[key] || key;
@@ -425,6 +426,7 @@
     fkOut: "FK out",
     callers: "Callers",
     callees: "Callees",
+    coverage: "Coverage %",
   };
   // Compact forms for the on-canvas node sublabel (space is tight there).
   var MAP_METRIC_ABBR = {
@@ -437,8 +439,13 @@
     fkOut: "fk→",
     callers: "in",
     callees: "out",
+    coverage: "cov",
   };
   // The order metrics are considered in for display (most salient first).
+  // coverage is LAST on purpose: the sublabel shows only the first 2 and the
+  // hover card the first 3 entries, so coverage appears in the full detail
+  // panel without crowding the canvas (the coverage overlay conveys it via
+  // ring color anyway).
   var MAP_METRIC_ORDER = [
     "dependents",
     "imports",
@@ -449,6 +456,7 @@
     "fkOut",
     "churn",
     "loc",
+    "coverage",
   ];
   // nodeMetricEntries returns a node's non-zero metrics as [key, value]
   // pairs in MAP_METRIC_ORDER — the shared basis for the sublabel, hover
@@ -927,7 +935,27 @@
     // maps onto the calm→hot ramp.
     var meta = data.meta || {};
     var sizeByKey = meta.sizeBy || "dependents";
-    var colorByKey = meta.colorBy || "churn";
+    // colorBy defaults to the graph's own meta.colorBy ("churn"), but the
+    // rail's "Color by" control can override it per-tab via
+    // state.mapView.colorBy — e.g. switch the Service map to the coverage
+    // overlay. The override is only honored if some node actually carries
+    // that metric, so a choice made on one tab can't mis-color another
+    // graph that lacks it (every ER/call-graph node would read 0).
+    function anyNodeHasMetric(key) {
+      for (var i = 0; i < nodes.length; i++) {
+        if (nodes[i].metrics && typeof nodes[i].metrics[key] === "number") return true;
+      }
+      return false;
+    }
+    var mvColorBy = state.mapView && state.mapView.colorBy;
+    var colorByKey =
+      mvColorBy && anyNodeHasMetric(mvColorBy) ? mvColorBy : meta.colorBy || "churn";
+    // coverage is "good when high", so its ring heat is INVERTED: an
+    // untested package (low %) burns hot (red), a well-covered one stays
+    // calm. It's also scaled against an ABSOLUTE 0–100 range (not the
+    // graph's own max like other metrics) so 50% always reads as mid-heat.
+    var COLOR_INVERTED = { coverage: true };
+    var isInvertedColor = !!COLOR_INVERTED[colorByKey];
 
     // Repo ids are attacker-influenced strings (a package literally named
     // "__proto__" is legal); Object.create(null) keeps such a key from
@@ -949,6 +977,13 @@
       return 9 + 17 * (metricVal(n, sizeByKey) / maxSize);
     }
     function colorFrac(n) {
+      if (isInvertedColor) {
+        // Absolute 0–100 scale, inverted: 0% → 1 (hot), 100% → 0 (calm).
+        var v = metricVal(n, colorByKey);
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        return (100 - v) / 100;
+      }
       return maxColor > 0 ? metricVal(n, colorByKey) / maxColor : 0;
     }
     function heatColor(n) {
@@ -1375,6 +1410,36 @@
     var heatWrap = document.createElement("div");
     var heatLabel = document.createElement("h4");
     heatLabel.textContent = "Ring color — " + mapMetricLabel(colorByKey);
+    heatWrap.appendChild(heatLabel);
+
+    // "Color by" picker: offered only when the graph actually carries more
+    // than one color-able metric (so the Service map gains a churn↔coverage
+    // toggle, while ER/call-graph maps keep their single static legend).
+    // Candidates are the graph's default colorBy plus coverage when present.
+    var colorOptions = [];
+    [meta.colorBy || "churn", "coverage"].forEach(function (k) {
+      if (anyNodeHasMetric(k) && colorOptions.indexOf(k) < 0) colorOptions.push(k);
+    });
+    if (colorOptions.length > 1) {
+      var colorSelect = document.createElement("select");
+      colorSelect.className = "map-select";
+      colorOptions.forEach(function (k) {
+        var o = document.createElement("option");
+        o.value = k;
+        o.textContent = mapMetricLabel(k);
+        colorSelect.appendChild(o);
+      });
+      colorSelect.value = colorByKey;
+      colorSelect.addEventListener("change", function () {
+        // Default colorBy stays implicit (undefined) so a tab switch resets
+        // naturally; only a non-default choice is stored.
+        state.mapView.colorBy =
+          colorSelect.value === (meta.colorBy || "churn") ? undefined : colorSelect.value;
+        refreshMapView();
+      });
+      heatWrap.appendChild(colorSelect);
+    }
+
     var heatLegend = document.createElement("div");
     heatLegend.className = "map-legend";
     var heatbar = document.createElement("div");
@@ -1382,14 +1447,15 @@
     var heatLabels = document.createElement("div");
     heatLabels.className = "map-heat-labels";
     var calmLabel = document.createElement("span");
-    calmLabel.textContent = "calm";
     var hotLabel = document.createElement("span");
-    hotLabel.textContent = "hot";
+    // For coverage the ramp is inverted and absolute: calm = fully tested,
+    // hot = untested. Other metrics read calm→hot over the graph's range.
+    calmLabel.textContent = isInvertedColor ? "100% tested" : "calm";
+    hotLabel.textContent = isInvertedColor ? "untested" : "hot";
     heatLabels.appendChild(calmLabel);
     heatLabels.appendChild(hotLabel);
     heatLegend.appendChild(heatbar);
     heatLegend.appendChild(heatLabels);
-    heatWrap.appendChild(heatLabel);
     heatWrap.appendChild(heatLegend);
     rail.appendChild(heatWrap);
 

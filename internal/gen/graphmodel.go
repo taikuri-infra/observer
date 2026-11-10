@@ -55,6 +55,14 @@ type GraphMetrics struct {
 	// ("callers"), so the key must match the JSON tag exactly.
 	Callers int `json:"callers,omitempty"`
 	Callees int `json:"callees,omitempty"`
+	// Coverage is a 0-100 STATIC test-coverage proxy (see testednessProxy),
+	// set only on GraphModel's package nodes (the Service map). It is a
+	// POINTER so that 0% (an untested package — the exact thing the
+	// coverage overlay highlights) is still emitted, while every other
+	// generator's nodes (tables, funcs) that have no coverage concept leave
+	// it nil → omitempty drops it. The map's "color by coverage" overlay
+	// reads this key.
+	Coverage *int `json:"coverage,omitempty"`
 }
 
 type GraphLocation struct {
@@ -270,6 +278,10 @@ func GraphModel(repoDir, moduleDir string) (*Graph, error) {
 			links = append(links, GraphLink{Type: InferLinkType(doc.Task), ID: doc.Task})
 		}
 
+		// Fresh per-iteration variable so &cov is a distinct pointer per
+		// node (the Metrics.Coverage field is *int).
+		cov := testednessProxy(pi.dir, pi.goFiles)
+
 		nodes = append(nodes, GraphNode{
 			ID:    id,
 			Label: labelFor(id),
@@ -279,6 +291,7 @@ func GraphModel(repoDir, moduleDir string) (*Graph, error) {
 				Imports:    outdeg[id],
 				Churn:      churnByDir[locPath],
 				LOC:        sumLines(pi.dir),
+				Coverage:   &cov,
 			},
 			Location: GraphLocation{
 				Path:        locPath,

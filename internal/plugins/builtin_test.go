@@ -64,11 +64,14 @@ func TestDefaultTabsFixture(t *testing.T) {
 	if tabs[0].Name != "Overview" {
 		t.Fatalf("tabs[0] = %q, want Overview", tabs[0].Name)
 	}
-	if tabs[1].Name != "Service map" {
-		t.Fatalf("tabs[1] = %q, want Service map (2nd tab, right after Overview)", tabs[1].Name)
+	if tabs[1].Name != "AI context" {
+		t.Fatalf("tabs[1] = %q, want AI context (2nd tab, right after Overview)", tabs[1].Name)
 	}
-	if tabs[2].Name != "Changes" {
-		t.Fatalf("tabs[2] = %q, want Changes (right after Service map)", tabs[2].Name)
+	if tabs[2].Name != "Service map" {
+		t.Fatalf("tabs[2] = %q, want Service map (3rd tab, right after AI context)", tabs[2].Name)
+	}
+	if tabs[3].Name != "Changes" {
+		t.Fatalf("tabs[3] = %q, want Changes (right after Service map)", tabs[3].Name)
 	}
 
 	changes, ok := findTabByName(tabs, "Changes")
@@ -82,37 +85,12 @@ func TestDefaultTabsFixture(t *testing.T) {
 		t.Fatalf("Changes command wrong: %q", changes.Command)
 	}
 
-	// Two main packages (cmd/server, cmd/worker) under one module -> two
-	// disambiguated Call graph tabs, each targeting exactly one main (the
-	// whole point: go-callvis errors on a pattern matching more than one).
-	callGraphServer, ok := findTabByName(tabs, "Call graph (cmd/server)")
-	if !ok {
-		t.Fatalf("missing Call graph (cmd/server) tab: %+v", tabs)
-	}
-	if callGraphServer.Renderer != "map" || callGraphServer.Kind != manifest.KindGenerator {
-		t.Fatalf("Call graph (cmd/server) tab wrong: %+v", callGraphServer)
-	}
-	if callGraphServer.Dir != "" {
-		t.Fatalf("Call graph tab must run from the repo root (no Dir), got %q", callGraphServer.Dir)
-	}
-	if len(callGraphServer.Requires) == 0 || callGraphServer.Requires[0] != "go-callvis" {
-		t.Fatalf("Call graph (cmd/server) tab missing go-callvis requirement: %+v", callGraphServer)
-	}
-	if !strings.Contains(callGraphServer.Command, "observer gen callgraphmodel") ||
-		!strings.Contains(callGraphServer.Command, "--dir 'services/api'") ||
-		!strings.Contains(callGraphServer.Command, "--main 'cmd/server'") {
-		t.Fatalf("Call graph (cmd/server) command wrong: %q", callGraphServer.Command)
-	}
-
-	callGraphWorker, ok := findTabByName(tabs, "Call graph (cmd/worker)")
-	if !ok {
-		t.Fatalf("missing Call graph (cmd/worker) tab: %+v", tabs)
-	}
-	if !strings.Contains(callGraphWorker.Command, "--main 'cmd/worker'") {
-		t.Fatalf("Call graph (cmd/worker) command wrong: %q", callGraphWorker.Command)
-	}
-	if callGraphServer.Output == callGraphWorker.Output {
-		t.Fatalf("Call graph tabs must have disambiguated output files, both got %q", callGraphServer.Output)
+	// Call graph tabs were removed from the lean default set — even with two
+	// mains (cmd/server, cmd/worker) present, none must be emitted.
+	for _, tab := range tabs {
+		if strings.HasPrefix(tab.Name, "Call graph") {
+			t.Fatalf("Call graph tabs must no longer be scaffolded by default: %+v", tab)
+		}
 	}
 
 	svcMap, ok := findTabByName(tabs, "Service map")
@@ -143,21 +121,10 @@ func TestDefaultTabsFixture(t *testing.T) {
 		t.Fatalf("Database command missing --json-out: %q", db.Command)
 	}
 
-	fe, ok := findTabByName(tabs, "Frontend deps")
-	if !ok {
-		t.Fatalf("missing Frontend deps tab: %+v", tabs)
-	}
-	if fe.Dir != "" {
-		t.Fatalf("Frontend deps tab must run from the repo root (no Dir), got %q", fe.Dir)
-	}
-	if fe.Renderer != "map" {
-		t.Fatalf("Frontend deps renderer = %q, want map (canvas)", fe.Renderer)
-	}
-	if !strings.Contains(fe.Command, "--dir 'apps/web'") {
-		t.Fatalf("Frontend deps command missing --dir 'apps/web': %q", fe.Command)
-	}
-	if len(fe.Requires) == 0 || fe.Requires[0] != "depcruise" {
-		t.Fatalf("Frontend deps tab wrong requires: %+v", fe)
+	// Frontend deps tabs were likewise removed from the lean default set —
+	// the fixture's apps/web package must NOT produce one.
+	if _, ok := findTabByName(tabs, "Frontend deps"); ok {
+		t.Fatalf("Frontend deps tabs must no longer be scaffolded by default: %+v", tabs)
 	}
 
 	// Manifest-level validation must accept everything DefaultTabs produces.
@@ -194,26 +161,17 @@ func TestDefaultTabsServicePlus(t *testing.T) {
 		t.Fatalf("missing/incorrect Service map tab for servicePlus: %+v (ok=%v)", svcMap, ok)
 	}
 
-	// servicePlus's services/api module has four "package main" dirs
-	// (cmd/server, cmd/retention-sweeper, scripts/bootstrap_billing,
-	// scripts/migrate-projects-to-tenant-db) — DefaultTabs must emit one
-	// disambiguated Call graph tab per main rather than erroring the way
-	// go-callvis itself does on "./..." with more than one main.
-	var callGraphTabs []manifest.Tab
+	// The lean default set emits NO Call graph or Frontend deps tabs, even
+	// though servicePlus's services/api has four "package main" dirs and
+	// there are frontend packages under apps/ — removed as clutter.
 	for _, tab := range tabs {
-		if strings.HasPrefix(tab.Name, "Call graph") {
-			callGraphTabs = append(callGraphTabs, tab)
+		if strings.HasPrefix(tab.Name, "Call graph") || strings.HasPrefix(tab.Name, "Frontend deps") {
+			t.Fatalf("lean default set must not scaffold %q", tab.Name)
 		}
 	}
-	if len(callGraphTabs) < 2 {
-		t.Fatalf("expected multiple Call graph tabs for servicePlus's multi-main services/api module, got %+v", callGraphTabs)
-	}
-	callGraphServer, ok := findTabByName(tabs, "Call graph (cmd/server)")
-	if !ok || callGraphServer.Renderer != "map" {
-		t.Fatalf("missing/incorrect Call graph (cmd/server) tab: %+v (ok=%v)", callGraphServer, ok)
-	}
-	if !strings.Contains(callGraphServer.Command, "--dir 'services/api'") {
-		t.Fatalf("Call graph (cmd/server) command missing --dir 'services/api': %q", callGraphServer.Command)
+	// It MUST emit an "API routes" tab for the Fiber module, though.
+	if apiTab, ok := findTabByName(tabs, "API routes"); !ok || apiTab.Renderer != "table" {
+		t.Fatalf("missing/incorrect API routes tab for servicePlus's Fiber module: %+v (ok=%v)", apiTab, ok)
 	}
 
 	var dbTabs []manifest.Tab
@@ -236,52 +194,6 @@ func TestDefaultTabsServicePlus(t *testing.T) {
 	}
 	if !foundTenantMigrations {
 		t.Fatalf("no Database tab references tenant_migrations: %+v", dbTabs)
-	}
-}
-
-// TestGoCallGraphTabsMultiModuleNoCollision guards the call-graph
-// disambiguation fix: two Go modules that each have a `cmd/server` main
-// must NOT collapse to one duplicate tab name (which breaks
-// /api/artifact?tab= lookup) or one shared output file (last-write-wins).
-// Both must be unique, keyed on the main's full repo-relative path.
-func TestGoCallGraphTabsMultiModuleNoCollision(t *testing.T) {
-	repo := t.TempDir()
-	write := func(rel, content string) {
-		path := filepath.Join(repo, rel)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write("services/api/go.mod", "module example.com/api\n\ngo 1.22\n")
-	write("services/api/cmd/server/main.go", "package main\n\nfunc main() {}\n")
-	write("services/worker/go.mod", "module example.com/worker\n\ngo 1.22\n")
-	write("services/worker/cmd/server/main.go", "package main\n\nfunc main() {}\n")
-
-	tabs, err := goCallGraphTabs(repo, []string{"services/api", "services/worker"})
-	if err != nil {
-		t.Fatalf("goCallGraphTabs: %v", err)
-	}
-	if len(tabs) != 2 {
-		t.Fatalf("expected 2 call-graph tabs, got %d: %+v", len(tabs), tabs)
-	}
-	names := map[string]bool{}
-	outputs := map[string]bool{}
-	for _, tb := range tabs {
-		if names[tb.Name] {
-			t.Fatalf("duplicate call-graph tab name %q: %+v", tb.Name, tabs)
-		}
-		if outputs[tb.Output] {
-			t.Fatalf("duplicate call-graph output %q: %+v", tb.Output, tabs)
-		}
-		names[tb.Name] = true
-		outputs[tb.Output] = true
-	}
-	// The display name must carry the module so the two are tellable apart.
-	if !names["Call graph (services/api/cmd/server)"] || !names["Call graph (services/worker/cmd/server)"] {
-		t.Fatalf("tab names should include the full main path: %v", names)
 	}
 }
 
