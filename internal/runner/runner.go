@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/taikuri-infra/observer/internal/gitmeta"
@@ -64,6 +65,20 @@ func Run(ctx context.Context, repo, base string, t manifest.Tab, now time.Time) 
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "sh", "-c", command)
 	cmd.Dir = filepath.Join(repo, t.Dir)
+	// Run the generator in its own process group (Setpgid) and, on ctx
+	// cancel/timeout, SIGKILL the WHOLE group, not just the `sh` leader.
+	// A generator like `go list`/`depcruise`/`go-callvis` forks children;
+	// killing only the leader would orphan those, and (for atref's ephemeral
+	// worktree builds) a surviving child keeps the worktree busy so cleanup
+	// can't remove it. Reaping the group closes that.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			// Negative pid => signal the entire process group.
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return nil
+	}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		a.Err = fmt.Sprintf("%v: %s", err, out)
 		return a, err

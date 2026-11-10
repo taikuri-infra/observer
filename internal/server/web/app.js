@@ -14,13 +14,22 @@
     activeTab: null, // manifest.Tab
     vizInstance: null, // cached Viz.js instance (lazy)
 
-    // ---- git-aware diff overlay ("Compare vs", every map tab) ----
+    // ---- git-aware map: View one ref / Compare two refs ----
     gitRefsPromise: null, // shared in-flight/resolved /api/gitrefs fetch
     gitRefs: null, // { current, branches, tags } once loaded
-    gitBase: "", // "" = overlay off; else the selected ref name — sticky across tab switches
-    gitBaseDefaulted: false, // true once we've auto-picked a default for the Changes tab (never re-auto-pick after that, even if the user then turns it off)
-    gitDiffCache: Object.create(null), // base ref -> Promise<{base,baseResolved,files}>
-    mapGen: 0, // bumped on every renderMap call; async callbacks compare against it to no-op after their tab was torn down
+    // Per (tab, ref) cache of a built graph.json from /api/graphat. A ref's
+    // graph is immutable per commit (the backend caches per commit too), so
+    // re-selecting a ref is instant. "" / "working" never goes through here
+    // (it's the already-loaded artifact). Promise-valued so concurrent
+    // selects share one in-flight fetch.
+    graphAtCache: Object.create(null), // "tab\nref" -> Promise<graphData>
+    // Staleness guard: bumped on every (re)render AND every selection
+    // change, so a late /api/graphat response for a since-superseded
+    // selection is ignored instead of painting a stale graph.
+    mapGen: 0,
+    // Per-map UI state, sticky across re-renders WITHIN a tab (reset when
+    // the active tab changes): which mode and which refs are selected.
+    mapView: null, // { mode, viewRef, fromRef, toRef, tabName, workingData }
   };
 
   var mermaidCounter = 0;
@@ -154,6 +163,12 @@
   }
 
   function loadArtifact(tab) {
+    // Invalidate any in-flight /api/graphat map build before we repaint:
+    // refreshMapView() only bumps state.mapGen on map→map transitions, so
+    // switching from a map tab to a NON-map tab (or reloading the same
+    // tab's artifact) would otherwise let a late build's .then() paint a
+    // stale map over this tab's content. Bumping here fences all of them.
+    state.mapGen++;
     els.content.innerHTML = '<p class="empty">Loading&hellip;</p>';
     fetch("/api/artifact?tab=" + encodeURIComponent(tab.name))
       .then(function (r) {
@@ -181,6 +196,15 @@
   function onUpdateClick() {
     var tab = state.activeTab;
     if (!tab) return;
+    // The working tree is about to change (a regenerate, and the user may
+    // have just switched branches), so the client-side per-ref graph cache
+    // and the cached ref list are both potentially stale: a branch that
+    // advanced would otherwise keep serving its old graph, and a
+    // newly-created branch would never appear in the pickers. Drop both;
+    // the per-commit SERVER cache (keyed by SHA, not ref name) stays valid
+    // and remains the real cache.
+    state.graphAtCache = Object.create(null);
+    state.gitRefsPromise = null;
     els.updateBtn.disabled = true;
     els.updateBtn.classList.add("busy");
     els.updateBtn.textContent = "Updating…";
@@ -464,9 +488,9 @@
     return d;
   }
 
-  // ---- git-aware diff overlay: data loading ----
+  // ---- git-aware map: data loading (View / Compare across refs) ----
   //
-  // /api/gitrefs and /api/gitdiff are plain same-origin GETs (no mutation,
+  // /api/gitrefs and /api/graphat are plain same-origin GETs (no mutation,
   // so — like /api/project and /api/artifact — no X-Observer CSRF header
   // is needed); the browser sends the observer_token cookie automatically.
 
@@ -488,32 +512,60 @@
     return state.gitRefsPromise;
   }
 
-  function fetchGitDiff(base) {
-    if (!base) return Promise.resolve(null);
-    if (state.gitDiffCache[base]) return state.gitDiffCache[base];
-    var p = fetch("/api/gitdiff?base=" + encodeURIComponent(base))
+  // isWorkingRef treats "" and "working" as the current working tree — the
+  // already-loaded artifact, never a /api/graphat fetch.
+  function isWorkingRef(ref) {
+    return ref === "" || ref === "working";
+  }
+
+  // fetchGraphAt builds (server-side, in an isolated worktree, cached per
+  // commit) tab's graph.json as it existed at ref, and parses it. On a ref
+  // whose code doesn't build the server returns a JSON { error } with a
+  // non-2xx status; we surface that error's message so the caller can show
+  // it in the canvas instead of a broken UI.
+  function fetchGraphAt(tabName, ref) {
+    return fetch("/api/graphat?tab=" + encodeURIComponent(tabName) + "&ref=" + encodeURIComponent(ref))
       .then(function (r) {
-        if (!r.ok) {
-          return r.text().then(function (body) {
-            throw new Error("GET /api/gitdiff: " + r.status + " " + body);
-          });
-        }
-        return r.json();
-      })
-      .catch(function (err) {
-        delete state.gitDiffCache[base]; // don't cache a failure — allow retry
-        throw err;
+        return r.text().then(function (body) {
+          if (!r.ok) {
+            var msg = body;
+            try {
+              var j = JSON.parse(body);
+              if (j && j.error) msg = j.error;
+            } catch (e) {
+              /* non-JSON error body: use the raw text */
+            }
+            throw new Error(msg || "GET /api/graphat: " + r.status);
+          }
+          var data = JSON.parse(body);
+          if (!data || !Array.isArray(data.nodes)) {
+            throw new Error('graph at "' + ref + '" has no "nodes" array');
+          }
+          return data;
+        });
       });
-    state.gitDiffCache[base] = p;
+  }
+
+  // graphForRef resolves tab's graph at ref: the current working tree
+  // (workingData, instant — no fetch) for a working ref, else a cached
+  // /api/graphat build. A failed build is NOT cached, so changing to a
+  // buildable ref and back retries.
+  function graphForRef(tabName, ref, workingData) {
+    if (isWorkingRef(ref)) return Promise.resolve(workingData);
+    var key = tabName + "\n" + ref;
+    if (state.graphAtCache[key]) return state.graphAtCache[key];
+    var p = fetchGraphAt(tabName, ref);
+    state.graphAtCache[key] = p;
+    p.catch(function () {
+      delete state.graphAtCache[key];
+    });
     return p;
   }
 
-  // pickDefaultBase picks the ref the "Compare vs" picker should default
-  // to when a map tab wants diff mode on from the start (currently: the
-  // Changes tab) — the repo's "main"/"master" branch if either exists,
-  // else whatever branch is currently checked out, else the first branch
-  // for lack of anything better.
-  function pickDefaultBase(refs) {
+  // defaultBaseRef is the ref Compare mode defaults its "From" to: the
+  // repo's main/master if present, else the currently checked-out branch,
+  // else the first branch — matching the old overlay's base default.
+  function defaultBaseRef(refs) {
     if (!refs) return "";
     var branches = refs.branches || [];
     if (branches.indexOf("main") >= 0) return "main";
@@ -522,172 +574,349 @@
     return branches[0] || "";
   }
 
-  // ---- git-aware diff overlay: node classification ----
+  // ---- git-aware map: structural diff of two graphs ----
   //
-  // Mirrors the generator-side convention (graphmodel.go/callgraphmodel.go)
-  // and splits cleanly on whether a node is FILE-PRECISE:
+  // Compare mode diffs the From and To graphs purely by node id + local
+  // structure (no git/file knowledge — that's /api/graphat's job):
+  //   - added    = id in To, not in From
+  //   - removed  = id in From, not in To (listed in the rail; not drawn,
+  //                since the canvas shows the To graph)
+  //   - changed  = id in both, but its sorted outgoing-edge target ids OR
+  //                its structural metrics differ
+  //   - unchanged = everything else
   //
-  //  - A "func" node WITH loc.primaryFile (CallGraphModel's go/ast
-  //    enrichment) is classified ONLY by that one file's diff entry — its
-  //    own [lineStart,lineEnd] against that file's hunks. It NEVER falls
-  //    through to the package-directory scan: editing one file in a
-  //    package must not amber-flag every OTHER function in it. A func whose
-  //    own file isn't in the diff is "unchanged", full stop.
-  //
-  //  - Every other node's location.path is a package/migrations DIRECTORY,
-  //    where diffing only ever answers "changed" (if ANY file under it
-  //    changed) — never "added", since a package isn't "added" just because
-  //    the files under it are new.
-  //
-  // A hunk is { start, count, oldCount }: oldCount is how many base-side
-  // lines it replaced. "added" requires PURE-INSERTION hunks (oldCount ===
-  // 0) covering the whole function — a fully-rewritten existing function
-  // has oldCount > 0 and is therefore "changed", not "added".
+  // KNOWN LIMITATION (v1, acceptable): a function whose BODY changed but
+  // whose calls + metrics didn't is seen as "unchanged" — structural diff
+  // can't see inside a body. Noted, not fixed here.
 
-  function nodeHunks(entry) {
-    return Array.isArray(entry.hunks) ? entry.hunks : [];
-  }
-  function hunkEnd(h) {
-    return h.start + Math.max(h.count, 1) - 1;
-  }
-  function intersectingHunks(start, end, hunks) {
-    return hunks.filter(function (h) {
-      return start <= hunkEnd(h) && end >= h.start;
+  // STRUCTURAL_METRIC_KEYS are the metrics that reflect a node's shape in
+  // the graph (degree/cardinality), NOT its volatile history. churn and loc
+  // are deliberately EXCLUDED: both legitimately differ between two refs
+  // (churn counts commits up to each ref; loc tracks file size) even when a
+  // node's structure is identical, so including them would mark almost
+  // everything "changed".
+  var STRUCTURAL_METRIC_KEYS = [
+    "dependents",
+    "imports",
+    "callers",
+    "callees",
+    "columns",
+    "fkIn",
+    "fkOut",
+  ];
+
+  // buildAdjacency returns a from-id -> sorted unique target-id[] map for a
+  // graph's edges, computed in ONE pass. Precomputing this once per graph
+  // turns diffGraphs from O(N·E) (outgoingTargets rescanned every edge per
+  // node) into O(N + E).
+  function buildAdjacency(edges) {
+    var seen = Object.create(null); // from -> { to -> true }
+    var adj = Object.create(null); // from -> [to]
+    edges.forEach(function (e) {
+      var s = seen[e.from];
+      if (!s) {
+        s = seen[e.from] = Object.create(null);
+        adj[e.from] = [];
+      }
+      if (!s[e.to]) {
+        s[e.to] = true;
+        adj[e.from].push(e.to);
+      }
     });
+    Object.keys(adj).forEach(function (from) {
+      adj[from].sort();
+    });
+    return adj;
   }
-  function rangeWhollyWithinHunks(start, end, hunks) {
-    // Every line of [start,end] is covered by the union of the hunks.
-    for (var ln = start; ln <= end; ln++) {
-      var covered = hunks.some(function (h) {
-        return ln >= h.start && ln <= hunkEnd(h);
-      });
-      if (!covered) return false;
+
+  // targetsFor returns a node id's sorted outgoing targets from a prebuilt
+  // adjacency map (empty array when the node has no outgoing edges).
+  function targetsFor(adj, id) {
+    return adj[id] || [];
+  }
+
+  function sameStringArray(a, b) {
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return false;
     }
     return true;
   }
 
-  // classifyFuncByFile is the file-precise path: a func node's own line
-  // range against its own file's hunks.
-  function classifyFuncByFile(loc, entry) {
-    var hunks = nodeHunks(entry);
-    var start = loc.lineStart,
-      end = typeof loc.lineEnd === "number" && loc.lineEnd >= start ? loc.lineEnd : start;
-    if (typeof start !== "number" || start <= 0 || hunks.length === 0) {
-      // No usable line range or no hunk detail — fall back to the file's
-      // own status (a whole new file ⇒ added; a deleted file is out of
-      // scope for "removed" nodes ⇒ unchanged; otherwise changed).
-      if (entry.status === "A") return "added";
-      if (entry.status === "D") return "unchanged";
-      return "changed";
+  function structuralMetricsDiffer(a, b) {
+    var ma = (a && a.metrics) || {};
+    var mb = (b && b.metrics) || {};
+    for (var i = 0; i < STRUCTURAL_METRIC_KEYS.length; i++) {
+      var k = STRUCTURAL_METRIC_KEYS[i];
+      if ((ma[k] || 0) !== (mb[k] || 0)) return true;
     }
-    var hit = intersectingHunks(start, end, hunks);
-    if (hit.length === 0) {
-      // The file changed, but not this function's own lines.
-      return entry.status === "A" ? "added" : "unchanged";
+    return false;
+  }
+
+  function nodeStructurallyDiffers(fromNode, toNode, fromAdj, toAdj) {
+    if (!sameStringArray(targetsFor(fromAdj, fromNode.id), targetsFor(toAdj, toNode.id))) {
+      return true;
     }
-    var allPureInsertion = hit.every(function (h) {
-      return (h.oldCount || 0) === 0;
+    return structuralMetricsDiffer(fromNode, toNode);
+  }
+
+  // diffGraphs returns { status: {id->"added"|"changed"|"unchanged"} for
+  // nodes IN THE TO GRAPH, removed: [ids] present only in From, added,
+  // changed, removedCount }.
+  function diffGraphs(fromData, toData) {
+    var fromEdges = Array.isArray(fromData.edges) ? fromData.edges : [];
+    var toEdges = Array.isArray(toData.edges) ? toData.edges : [];
+    var fromAdj = buildAdjacency(fromEdges);
+    var toAdj = buildAdjacency(toEdges);
+    var fromById = Object.create(null);
+    (fromData.nodes || []).forEach(function (n) {
+      fromById[n.id] = n;
     });
-    if (allPureInsertion && rangeWhollyWithinHunks(start, end, hunks)) return "added";
-    return "changed";
-  }
+    var toById = Object.create(null);
+    (toData.nodes || []).forEach(function (n) {
+      toById[n.id] = n;
+    });
 
-  // funcPrimaryFile returns a func node's own file when it has one (the
-  // file-precise classification key), else "".
-  function funcPrimaryFile(n) {
-    var loc = n.location || {};
-    return n.kind === "func" && loc.primaryFile ? loc.primaryFile : "";
-  }
-
-  // matchedFilesForNode returns the diff entries a node resolves to, in
-  // the SAME priority classifyForNode uses, so the detail panel shows
-  // exactly what the classification looked at: a file-precise func node ⇒
-  // only its own file (or nothing, if untouched); a directory node ⇒ every
-  // changed file under it.
-  function matchedFilesForNode(n, diffFiles) {
-    if (!diffFiles) return [];
-    var pf = funcPrimaryFile(n);
-    if (pf) {
-      return diffFiles[pf] ? [{ path: pf, entry: diffFiles[pf] }] : [];
-    }
-    var loc = n.location || {};
-    if (loc.path && diffFiles[loc.path]) {
-      return [{ path: loc.path, entry: diffFiles[loc.path] }];
-    }
-    var out = [];
-    if (loc.path) {
-      var prefix = loc.path === "." ? "" : loc.path + "/";
-      Object.keys(diffFiles).forEach(function (p) {
-        if (prefix === "" ? p.indexOf("/") < 0 : p.indexOf(prefix) === 0) {
-          out.push({ path: p, entry: diffFiles[p] });
-        }
-      });
-    }
-    return out;
-  }
-
-  function classifyForNode(n, diffFiles) {
-    if (!diffFiles) return null;
-    var loc = n.location || {};
-    var pf = funcPrimaryFile(n);
-    if (pf) {
-      // File-precise: ONLY this func's own file decides it. Not in the
-      // diff ⇒ unchanged, never a package-directory fall-through.
-      return diffFiles[pf] ? classifyFuncByFile(loc, diffFiles[pf]) : "unchanged";
-    }
-    // Directory node: an exact path hit, else any file under the dir.
-    if (loc.path && diffFiles[loc.path]) {
-      var e = diffFiles[loc.path];
-      if (e.status === "A") return "added";
-      if (e.status === "D") return "unchanged";
-      return "changed";
-    }
-    if (loc.path) {
-      var dirPrefix = loc.path === "." ? "" : loc.path + "/";
-      for (var p in diffFiles) {
-        if (!Object.prototype.hasOwnProperty.call(diffFiles, p)) continue;
-        var underDir = dirPrefix === "" ? p.indexOf("/") < 0 : p.indexOf(dirPrefix) === 0;
-        if (underDir) return "changed";
+    var status = Object.create(null);
+    var added = 0,
+      changed = 0;
+    (toData.nodes || []).forEach(function (n) {
+      var prev = fromById[n.id];
+      if (!prev) {
+        status[n.id] = "added";
+        added++;
+      } else if (nodeStructurallyDiffers(prev, n, fromAdj, toAdj)) {
+        status[n.id] = "changed";
+        changed++;
+      } else {
+        status[n.id] = "unchanged";
       }
-    }
-    return "unchanged";
+    });
+    var removed = [];
+    (fromData.nodes || []).forEach(function (n) {
+      if (!toById[n.id]) removed.push(n.id);
+    });
+    removed.sort();
+    return { status: status, removed: removed, added: added, changed: changed, removedCount: removed.length };
   }
 
+  // renderMap is the map CONTROLLER (the dispatcher's entry for
+  // renderer:"map"). It owns the View/Compare mode + ref selection
+  // (state.mapView), kicks off the needed /api/graphat builds with a
+  // spinner + staleness guard, and hands the resolved graph(s) to drawMap.
+  // The working-copy graph is `text` (the already-loaded artifact) — always
+  // instant, never re-fetched.
   function renderMap(text) {
-    // Bumped on every call so the async git-overlay fetches below can
-    // detect "this map tab was replaced before I resolved" and no-op
-    // instead of touching a torn-down DOM.
-    var mapGenAtRender = ++state.mapGen;
-
-    var data;
+    var workingData;
     try {
-      data = JSON.parse(text);
+      workingData = JSON.parse(text);
     } catch (err) {
       return renderRaw(text);
     }
-    if (!data || !Array.isArray(data.nodes)) {
+    if (!workingData || !Array.isArray(workingData.nodes)) {
       els.content.innerHTML = '<div class="error-banner">graph.json has no "nodes" array</div>';
       return;
     }
-    var nodes = data.nodes;
-    var edges = Array.isArray(data.edges) ? data.edges : [];
-
-    // "changes" mode (meta.source === "changes", from the Changes tab's
-    // gen.ChangedGraphModel): nodes carry a `changed` flag. When any node is
-    // changed, the default view lights those up and dims everything else;
-    // the detail panel also gains a "Changed files" section for them. With
-    // no changes, the map behaves exactly like a normal service map plus a
-    // one-line note.
-    var anyChanged = nodes.some(function (n) {
-      return !!n.changed;
-    });
-    function changedDim(n) {
-      return anyChanged && !n.changed;
-    }
-
     if (!window.dagre) {
       els.content.innerHTML = '<div class="error-banner">dagre.js not available</div>';
       return;
+    }
+
+    var tab = state.activeTab || {};
+    var tabName = tab.name || "";
+    var isChangesTab = (workingData.meta || {}).source === "changes";
+
+    // (Re)initialize per-tab view state when the active tab changes. The
+    // Changes tab opens in Compare mode (From = default base, To = working
+    // copy) so it keeps working as before; every other tab opens in View
+    // mode on the working copy.
+    var mv = state.mapView;
+    if (!mv || mv.tabName !== tabName) {
+      mv = {
+        tabName: tabName,
+        mode: isChangesTab ? "compare" : "view",
+        viewRef: "",
+        fromRef: isChangesTab ? "__default__" : "",
+        toRef: "",
+      };
+      state.mapView = mv;
+    }
+    mv.workingData = workingData;
+
+    refreshMapView();
+  }
+
+  // refreshMapView resolves the graph(s) the current mode+selection needs
+  // and (re)paints the map, with a spinner while any /api/graphat build is
+  // in flight and a staleness guard so a late build for a superseded
+  // selection never paints. It bumps state.mapGen; any async continuation
+  // bails unless its captured gen still matches.
+  function refreshMapView() {
+    var gen = ++state.mapGen;
+    var mv = state.mapView;
+    var tabName = mv.tabName;
+
+    fetchGitRefs()
+      .catch(function () {
+        return null; // refs are nice-to-have for the pickers; proceed without
+      })
+      .then(function (refs) {
+        if (gen !== state.mapGen) return;
+
+        // Resolve "__default__" (compare From's initial sentinel) now that
+        // refs are known.
+        if (mv.fromRef === "__default__") {
+          mv.fromRef = refs ? defaultBaseRef(refs) : "";
+        }
+        // Drop a selected ref that no longer exists (deleted branch, other
+        // repo) back to the working copy, so we never ask for a bad ref.
+        if (refs) {
+          var known = (refs.branches || []).concat(refs.tags || []);
+          function prune(ref) {
+            return ref && !isWorkingRef(ref) && known.indexOf(ref) < 0 ? "" : ref;
+          }
+          mv.viewRef = prune(mv.viewRef);
+          mv.fromRef = prune(mv.fromRef);
+          mv.toRef = prune(mv.toRef);
+        }
+
+        if (mv.mode === "compare") {
+          refreshCompare(gen, refs);
+        } else {
+          refreshViewMode(gen, refs);
+        }
+      });
+  }
+
+  function refreshViewMode(gen, refs) {
+    var mv = state.mapView;
+    var ref = mv.viewRef;
+    if (isWorkingRef(ref)) {
+      // Instant: the working-copy artifact is already parsed.
+      drawMap(mv.workingData, { mode: "view", refs: refs });
+      return;
+    }
+    showMapLoading("Analyzing " + ref + "…");
+    graphForRef(mv.tabName, ref, mv.workingData)
+      .then(function (data) {
+        if (gen !== state.mapGen) return;
+        drawMap(data, { mode: "view", refs: refs });
+      })
+      .catch(function (err) {
+        if (gen !== state.mapGen) return;
+        showMapError("Couldn’t build the graph at " + ref + ".", err);
+      });
+  }
+
+  function refreshCompare(gen, refs) {
+    var mv = state.mapView;
+    var fromRef = mv.fromRef,
+      toRef = mv.toRef;
+    showMapLoading("Comparing " + refLabel(fromRef) + " → " + refLabel(toRef) + "…");
+    Promise.all([
+      graphForRef(mv.tabName, fromRef, mv.workingData),
+      graphForRef(mv.tabName, toRef, mv.workingData),
+    ])
+      .then(function (both) {
+        if (gen !== state.mapGen) return;
+        var fromData = both[0],
+          toData = both[1];
+        var diff = diffGraphs(fromData, toData);
+        drawMap(toData, {
+          mode: "compare",
+          refs: refs,
+          fromRef: fromRef,
+          toRef: toRef,
+          status: diff.status,
+          removed: diff.removed,
+          summary: { added: diff.added, changed: diff.changed, removedCount: diff.removedCount },
+        });
+      })
+      .catch(function (err) {
+        if (gen !== state.mapGen) return;
+        showMapError(
+          "Couldn’t compare " + refLabel(fromRef) + " → " + refLabel(toRef) + ".",
+          err
+        );
+      });
+  }
+
+  // refLabel renders a ref for UI text: the working tree reads "working
+  // copy", everything else is its own name.
+  function refLabel(ref) {
+    return isWorkingRef(ref) ? "working copy" : ref;
+  }
+
+  // showMapLoading paints a centered spinner + message in the content
+  // area. It fully replaces content (the rail is rebuilt by the subsequent
+  // drawMap) — simple and robust; the selection that triggered it lives in
+  // state.mapView, so nothing is lost.
+  function showMapLoading(message) {
+    var wrap = document.createElement("div");
+    wrap.className = "map-loading-full";
+    var spin = document.createElement("div");
+    spin.className = "map-spinner";
+    var msg = document.createElement("div");
+    msg.className = "map-loading-msg";
+    msg.textContent = message;
+    wrap.appendChild(spin);
+    wrap.appendChild(msg);
+    setContent(wrap);
+  }
+
+  // showMapError paints an error state (a ref whose code didn't build, or a
+  // failed fetch) plus a button to return to the working copy, so the UI is
+  // never left broken. Both strings go through textContent.
+  function showMapError(headline, err) {
+    var wrap = document.createElement("div");
+    wrap.className = "map-error-full";
+    var h = document.createElement("div");
+    h.className = "map-error-headline";
+    h.textContent = headline;
+    var detail = document.createElement("div");
+    detail.className = "map-error-detail";
+    detail.textContent = err && err.message ? err.message : String(err || "");
+    var back = document.createElement("button");
+    back.type = "button";
+    back.className = "btn";
+    back.textContent = "Back to working copy";
+    back.addEventListener("click", function () {
+      var mv = state.mapView;
+      mv.mode = "view";
+      mv.viewRef = "";
+      refreshMapView();
+    });
+    wrap.appendChild(h);
+    wrap.appendChild(detail);
+    wrap.appendChild(back);
+    setContent(wrap);
+  }
+
+  // drawMap renders ONE graph (data) onto the canvas, optionally with a
+  // Compare overlay (overlay.status / overlay.removed). It fully rebuilds
+  // the map DOM (rail + stage) each call; the mode toggle + ref selects are
+  // rebuilt too, restoring their values from state.mapView. overlay:
+  //   { mode:"view"|"compare", refs, fromRef?, toRef?, status?, removed?,
+  //     summary? }
+  function drawMap(data, overlay) {
+    overlay = overlay || { mode: "view" };
+    var nodes = data.nodes;
+    var edges = Array.isArray(data.edges) ? data.edges : [];
+
+    // Compare overlay: per-node diff status (added/changed/unchanged) for
+    // nodes present in this (To) graph. null in View mode.
+    var diffStatus = overlay.mode === "compare" ? overlay.status || Object.create(null) : null;
+    function nodeDiffStatus(n) {
+      return diffStatus ? diffStatus[n.id] || "unchanged" : null;
+    }
+    function nodeIsDiffHot(n) {
+      var st = nodeDiffStatus(n);
+      return st === "added" || st === "changed";
+    }
+    // In Compare mode, dim unchanged nodes so the added/changed stand out
+    // (same emphasis the old overlay gave). View mode never dims by diff.
+    function diffDim(n) {
+      return !!diffStatus && !nodeIsDiffHot(n);
     }
 
     // Honor the meta seam: node size is driven by meta.sizeBy and ring
@@ -929,39 +1158,156 @@
     searchWrap.appendChild(search);
     rail.appendChild(searchWrap);
 
-    // ---- "Compare vs" git-aware diff overlay (every map tab) ----
-    var isChangesTab = meta.source === "changes";
-    var compareWrap = document.createElement("div");
-    var compareLabel = document.createElement("h4");
-    compareLabel.textContent = "Compare vs";
-    var compareSelect = document.createElement("select");
-    compareSelect.className = "map-select";
-    var offOpt = document.createElement("option");
-    offOpt.value = "";
-    offOpt.textContent = "— off —";
-    compareSelect.appendChild(offOpt);
-    var compareSummary = document.createElement("div");
-    compareSummary.className = "map-compare-summary";
-    var diffLegend = document.createElement("div");
-    diffLegend.className = "map-diff-legend";
-    function diffLegendRow(cls, label) {
-      var row = document.createElement("div");
-      row.className = "map-diff-legend-row";
-      var sw = document.createElement("span");
-      sw.className = "sw " + cls;
-      var lbl = document.createElement("span");
-      lbl.textContent = label;
-      row.appendChild(sw);
-      row.appendChild(lbl);
-      return row;
+    // ---- View / Compare across git refs ----
+    //
+    // Built from state.mapView (restores the current mode + ref selections
+    // after drawMap rebuilds the rail) and overlay.refs (the branch/tag
+    // lists). Each control mutates state.mapView and calls refreshMapView(),
+    // which re-resolves the needed graph(s) and repaints.
+    var mv = state.mapView;
+    var refs = overlay.refs || state.gitRefs || { branches: [], tags: [] };
+
+    // addRefOptions appends a "working copy" option + Branches/Tags
+    // optgroups to a <select>, then selects `current`. All option text via
+    // textContent.
+    function addRefOptions(sel, current) {
+      var wc = document.createElement("option");
+      wc.value = "";
+      wc.textContent = "working copy";
+      sel.appendChild(wc);
+      function group(label, names) {
+        if (!names || names.length === 0) return;
+        var g = document.createElement("optgroup");
+        g.label = label;
+        names.forEach(function (name) {
+          var o = document.createElement("option");
+          o.value = name;
+          o.textContent = name;
+          g.appendChild(o);
+        });
+        sel.appendChild(g);
+      }
+      group("Branches", refs.branches);
+      group("Tags", refs.tags);
+      sel.value = isWorkingRef(current) ? "" : current;
     }
-    diffLegend.appendChild(diffLegendRow("added", "Added vs base"));
-    diffLegend.appendChild(diffLegendRow("changed", "Changed vs base"));
-    compareWrap.appendChild(compareLabel);
-    compareWrap.appendChild(compareSelect);
-    compareWrap.appendChild(compareSummary);
-    compareWrap.appendChild(diffLegend);
-    rail.appendChild(compareWrap);
+
+    var gitWrap = document.createElement("div");
+    var gitLabel = document.createElement("h4");
+    gitLabel.textContent = "Git";
+    gitWrap.appendChild(gitLabel);
+
+    // Mode toggle: View | Compare.
+    var modeToggle = document.createElement("div");
+    modeToggle.className = "map-seg";
+    var btnView = document.createElement("button");
+    btnView.type = "button";
+    btnView.textContent = "View";
+    btnView.classList.toggle("on", mv.mode === "view");
+    var btnCompare = document.createElement("button");
+    btnCompare.type = "button";
+    btnCompare.textContent = "Compare";
+    btnCompare.classList.toggle("on", mv.mode === "compare");
+    btnView.addEventListener("click", function () {
+      if (mv.mode === "view") return;
+      mv.mode = "view";
+      refreshMapView();
+    });
+    btnCompare.addEventListener("click", function () {
+      if (mv.mode === "compare") return;
+      mv.mode = "compare";
+      // First time into Compare on this tab with no From yet: default it.
+      if (mv.fromRef === "" && mv.toRef === "") {
+        mv.fromRef = defaultBaseRef(refs);
+      }
+      refreshMapView();
+    });
+    modeToggle.appendChild(btnView);
+    modeToggle.appendChild(btnCompare);
+    gitWrap.appendChild(modeToggle);
+
+    if (mv.mode === "view") {
+      var showLabel = document.createElement("label");
+      showLabel.className = "map-sublabel";
+      showLabel.textContent = "Showing";
+      var viewSelect = document.createElement("select");
+      viewSelect.className = "map-select";
+      addRefOptions(viewSelect, mv.viewRef);
+      viewSelect.addEventListener("change", function () {
+        mv.viewRef = viewSelect.value;
+        refreshMapView();
+      });
+      gitWrap.appendChild(showLabel);
+      gitWrap.appendChild(viewSelect);
+    } else {
+      var fromLabel = document.createElement("label");
+      fromLabel.className = "map-sublabel";
+      fromLabel.textContent = "From";
+      var fromSelect = document.createElement("select");
+      fromSelect.className = "map-select";
+      addRefOptions(fromSelect, mv.fromRef);
+      fromSelect.addEventListener("change", function () {
+        mv.fromRef = fromSelect.value;
+        refreshMapView();
+      });
+      var toLabel = document.createElement("label");
+      toLabel.className = "map-sublabel";
+      toLabel.textContent = "To";
+      var toSelect = document.createElement("select");
+      toSelect.className = "map-select";
+      addRefOptions(toSelect, mv.toRef);
+      toSelect.addEventListener("change", function () {
+        mv.toRef = toSelect.value;
+        refreshMapView();
+      });
+      gitWrap.appendChild(fromLabel);
+      gitWrap.appendChild(fromSelect);
+      gitWrap.appendChild(toLabel);
+      gitWrap.appendChild(toSelect);
+
+      // Summary + diff legend + removed list.
+      var compareSummary = document.createElement("div");
+      compareSummary.className = "map-compare-summary";
+      var sm = overlay.summary || { added: 0, changed: 0, removedCount: 0 };
+      compareSummary.textContent =
+        "From " + refLabel(mv.fromRef) + " → To " + refLabel(mv.toRef) + ": " +
+        sm.added + " added · " + sm.removedCount + " removed · " + sm.changed + " changed";
+      gitWrap.appendChild(compareSummary);
+
+      var diffLegend = document.createElement("div");
+      diffLegend.className = "map-diff-legend";
+      function diffLegendRow(cls, label) {
+        var row = document.createElement("div");
+        row.className = "map-diff-legend-row";
+        var sw = document.createElement("span");
+        sw.className = "sw " + cls;
+        var lbl = document.createElement("span");
+        lbl.textContent = label;
+        row.appendChild(sw);
+        row.appendChild(lbl);
+        return row;
+      }
+      diffLegend.appendChild(diffLegendRow("added", "Added in To"));
+      diffLegend.appendChild(diffLegendRow("changed", "Changed"));
+      gitWrap.appendChild(diffLegend);
+
+      var removed = Array.isArray(overlay.removed) ? overlay.removed : [];
+      if (removed.length > 0) {
+        var remLabel = document.createElement("label");
+        remLabel.className = "map-sublabel";
+        remLabel.textContent = "Removed (" + removed.length + ")";
+        gitWrap.appendChild(remLabel);
+        var remList = document.createElement("ul");
+        remList.className = "map-removed-list";
+        removed.forEach(function (id) {
+          var li = document.createElement("li");
+          li.textContent = id;
+          remList.appendChild(li);
+        });
+        gitWrap.appendChild(remList);
+      }
+    }
+    rail.appendChild(gitWrap);
 
     var kindCounts = Object.create(null);
     nodes.forEach(function (n) {
@@ -1123,22 +1469,15 @@
     stage.appendChild(zoomRail);
     stage.appendChild(panel);
 
-    // "Changes" mode banner: lit-changed-nodes summary, or a "no changes vs
-    // base" note when the branch has nothing to show.
-    if (meta.source === "changes") {
+    // Compare-mode banner: the From → To summary, floated on the canvas so
+    // it's visible without scanning the rail. View mode draws no banner.
+    if (overlay.mode === "compare") {
       var banner = document.createElement("div");
-      banner.className = "map-changes-banner";
-      var baseName = meta.base || "base";
-      if (anyChanged) {
-        var changedCount = nodes.filter(function (n) {
-          return n.changed;
-        }).length;
-        banner.classList.add("has-changes");
-        banner.textContent =
-          changedCount + " package" + (changedCount === 1 ? "" : "s") + " changed vs " + baseName;
-      } else {
-        banner.textContent = "No changes vs " + baseName + " — showing the full package map.";
-      }
+      banner.className = "map-changes-banner has-changes";
+      var sm2 = overlay.summary || { added: 0, changed: 0, removedCount: 0 };
+      banner.textContent =
+        "From " + refLabel(overlay.fromRef) + " → To " + refLabel(overlay.toRef) + ": " +
+        sm2.added + " added · " + sm2.removedCount + " removed · " + sm2.changed + " changed";
       stage.appendChild(banner);
     }
 
@@ -1303,7 +1642,9 @@
         var heat = heatColor(n);
 
         var grp = svgEl("g", { class: "map-node", "data-id": id, "data-kind": n.kind });
-        if (n.changed) grp.classList.add("map-changed");
+        var st = nodeDiffStatus(n);
+        if (st === "added") grp.classList.add("map-diff-added");
+        else if (st === "changed") grp.classList.add("map-diff-changed");
         grp.style.color = heat;
 
         if (isTableCard(n)) {
@@ -1446,155 +1787,21 @@
       nodes.forEach(function (n) {
         var g = nodeEls[n.id];
         if (!g) return;
-        g.classList.toggle("map-dim", !nodeVisible(n, q) || dimByChangeOrDiff(n));
+        g.classList.toggle("map-dim", !nodeVisible(n, q) || diffDim(n));
       });
       edgeEls.forEach(function (x) {
         var na = byId[x.a],
           nbNode = byId[x.b];
         var visEdge = na && nbNode && nodeVisible(na, q) && nodeVisible(nbNode, q);
-        x.el.classList.toggle("map-dim", !visEdge || edgeDimByChangeOrDiff(na, nbNode));
+        // In Compare mode an edge stays lit only if it touches an
+        // added/changed node, so the diff reads clearly; View mode never
+        // dims by diff.
+        var edgeDiffDim =
+          !!diffStatus && !((na && nodeIsDiffHot(na)) || (nbNode && nodeIsDiffHot(nbNode)));
+        x.el.classList.toggle("map-dim", !visEdge || edgeDiffDim);
       });
     }
     search.addEventListener("input", applyFilters);
-
-    // ---- git-aware diff overlay: wiring ----
-    //
-    // diffState.active flips on once a base ref is selected AND its diff
-    // has actually loaded; diffState.status[id] is then the
-    // classifyForNode result for every node. While active, it SUPERSEDES
-    // the legacy ChangedGraphModel "changed" flag (dimByChangeOrDiff /
-    // edgeDimByChangeOrDiff below) — the two would otherwise disagree
-    // whenever the user picks a base other than main on the Changes tab.
-    var diffState = { active: false, files: null, status: Object.create(null) };
-
-    function nodeIsDiffHot(n) {
-      var st = diffState.status[n.id];
-      return st === "added" || st === "changed";
-    }
-    function dimByChangeOrDiff(n) {
-      if (diffState.active) return !nodeIsDiffHot(n);
-      return changedDim(n);
-    }
-    function edgeDimByChangeOrDiff(na, nb2) {
-      if (diffState.active) {
-        return !((na && nodeIsDiffHot(na)) || (nb2 && nodeIsDiffHot(nb2)));
-      }
-      return anyChanged && !(na && na.changed) && !(nb2 && nb2.changed);
-    }
-
-    function applyDiffClasses() {
-      nodes.forEach(function (n) {
-        var g = nodeEls[n.id];
-        if (!g) return;
-        var st = diffState.active ? diffState.status[n.id] : null;
-        g.classList.toggle("map-diff-added", st === "added");
-        g.classList.toggle("map-diff-changed", st === "changed");
-        // Legacy ChangedGraphModel highlighting is superseded by the
-        // overlay once it's active; fall back to it otherwise (overlay
-        // off, or its data failed to load).
-        g.classList.toggle("map-changed", !diffState.active && !!n.changed);
-      });
-      // The static "N packages changed vs main" banner (meta.source ===
-      // "changes") reflects the artifact's own hardcoded base=main
-      // comparison — once the overlay is active (which carries its own
-      // summary line, possibly against a DIFFERENT base the user picked),
-      // hide it rather than show two numbers that can disagree.
-      if (banner) banner.classList.toggle("map-banner-hidden", diffState.active);
-    }
-
-    function updateCompareSummary() {
-      if (!diffState.active) {
-        compareSummary.textContent = "";
-        return;
-      }
-      var added = 0,
-        changedCount = 0;
-      nodes.forEach(function (n) {
-        var st = diffState.status[n.id];
-        if (st === "added") added++;
-        else if (st === "changed") changedCount++;
-      });
-      compareSummary.textContent =
-        "vs " + state.gitBase + ": " + added + " added · " + changedCount + " changed";
-    }
-
-    function applyCompare() {
-      var base = state.gitBase;
-      var gen = state.mapGen;
-      if (!base) {
-        diffState.active = false;
-        diffState.files = null;
-        diffState.status = Object.create(null);
-        applyDiffClasses();
-        updateCompareSummary();
-        applyFilters();
-        return;
-      }
-      compareSummary.textContent = "loading…";
-      fetchGitDiff(base)
-        .then(function (resp) {
-          if (gen !== state.mapGen || state.gitBase !== base) return; // stale: tab changed, or base changed again mid-flight
-          diffState.active = true;
-          diffState.files = resp.files || {};
-          diffState.status = Object.create(null);
-          nodes.forEach(function (n) {
-            diffState.status[n.id] = classifyForNode(n, diffState.files);
-          });
-          applyDiffClasses();
-          updateCompareSummary();
-          applyFilters();
-        })
-        .catch(function () {
-          if (gen !== state.mapGen || state.gitBase !== base) return;
-          diffState.active = false;
-          compareSummary.textContent = "failed to load diff vs " + base;
-        });
-    }
-
-    compareSelect.addEventListener("change", function () {
-      state.gitBase = compareSelect.value;
-      state.gitBaseDefaulted = true; // the user took control: never auto-default again, even to "off"
-      applyCompare();
-    });
-
-    fetchGitRefs()
-      .then(function (refs) {
-        if (state.mapGen !== mapGenAtRender) return; // stale: another tab was selected before refs loaded
-        // Populate the <select>: off (already present) + branches + tags.
-        function addGroup(label, names) {
-          if (!names || names.length === 0) return;
-          var group = document.createElement("optgroup");
-          group.label = label;
-          names.forEach(function (name) {
-            var opt = document.createElement("option");
-            opt.value = name;
-            opt.textContent = name;
-            group.appendChild(opt);
-          });
-          compareSelect.appendChild(group);
-        }
-        addGroup("Branches", refs.branches);
-        addGroup("Tags", refs.tags);
-
-        if (!state.gitBaseDefaulted && isChangesTab) {
-          state.gitBase = pickDefaultBase(refs);
-          state.gitBaseDefaulted = true;
-        }
-        // A previously-selected ref might no longer exist (deleted
-        // branch, different repo) — fall back to off rather than asking
-        // the server for a ref it can't resolve.
-        var known = (refs.branches || []).concat(refs.tags || []);
-        if (state.gitBase && known.indexOf(state.gitBase) < 0) {
-          state.gitBase = "";
-        }
-        compareSelect.value = state.gitBase || "";
-        applyCompare();
-      })
-      .catch(function () {
-        if (state.mapGen !== mapGenAtRender) return;
-        compareSelect.disabled = true;
-        compareSummary.textContent = "git refs unavailable";
-      });
 
     // ---- hover metric card ----
     function showCard(n) {
@@ -1842,69 +2049,29 @@
         pb.appendChild(colSec);
       }
 
-      // Git diff vs the selected base ref (the overlay) when active;
-      // otherwise fall back to the legacy ChangedGraphModel flag.
-      if (diffState.active) {
-        var gitSec = document.createElement("div");
-        gitSec.className = "map-psec";
-        var gitH = document.createElement("h5");
-        gitH.textContent = "Git diff vs " + state.gitBase;
-        gitSec.appendChild(gitH);
-        var st = diffState.status[n.id] || "unchanged";
+      // Compare status: in Compare mode, note whether this node is
+      // added/changed/unchanged vs the From ref.
+      if (diffStatus) {
+        var cmpSec = document.createElement("div");
+        cmpSec.className = "map-psec";
+        var cmpH = document.createElement("h5");
+        cmpH.textContent = "Compare " + refLabel(overlay.fromRef) + " → " + refLabel(overlay.toRef);
+        cmpSec.appendChild(cmpH);
+        var st = nodeDiffStatus(n);
         var badge = document.createElement("span");
         badge.className = "map-tag map-diff-badge-" + st;
         badge.textContent = st === "added" ? "Added" : st === "changed" ? "Changed" : "Unchanged";
-        gitSec.appendChild(badge);
-        var matches = matchedFilesForNode(n, diffState.files);
-        if (matches.length > 0) {
-          var fileList = document.createElement("ul");
-          fileList.className = "map-changed-files";
-          matches.forEach(function (m) {
-            var li = document.createElement("li");
-            var text = m.path + " [" + m.entry.status + "]";
-            if (
-              n.kind === "func" &&
-              typeof loc.lineStart === "number" &&
-              loc.lineStart > 0 &&
-              Array.isArray(m.entry.hunks) &&
-              m.entry.hunks.length > 0
-            ) {
-              text += " — function lines " + loc.lineStart + "-" + loc.lineEnd;
-            }
-            li.textContent = text;
-            fileList.appendChild(li);
-          });
-          gitSec.appendChild(fileList);
-        } else {
-          var noMatch = document.createElement("div");
-          noMatch.className = "map-empty-doc";
-          noMatch.textContent = "No tracked file changes match this node vs " + state.gitBase + ".";
-          gitSec.appendChild(noMatch);
-        }
-        pb.appendChild(gitSec);
-      } else if (n.changed) {
-        var chSec = document.createElement("div");
-        chSec.className = "map-psec";
-        var chFiles = Array.isArray(n.changedFiles) ? n.changedFiles : [];
-        var chH = document.createElement("h5");
-        chH.textContent = "Changed files (" + chFiles.length + ")";
-        chSec.appendChild(chH);
-        if (chFiles.length === 0) {
-          var chEmpty = document.createElement("div");
-          chEmpty.className = "map-empty-doc";
-          chEmpty.textContent = "Flagged as changed, but no files were listed.";
-          chSec.appendChild(chEmpty);
-        } else {
-          var chList = document.createElement("ul");
-          chList.className = "map-changed-files";
-          chFiles.forEach(function (f) {
-            var li = document.createElement("li");
-            li.textContent = f;
-            chList.appendChild(li);
-          });
-          chSec.appendChild(chList);
-        }
-        pb.appendChild(chSec);
+        cmpSec.appendChild(badge);
+        var cmpNote = document.createElement("div");
+        cmpNote.className = "map-empty-doc";
+        cmpNote.textContent =
+          st === "added"
+            ? "Present in To, not in From."
+            : st === "changed"
+            ? "Its outgoing calls or structural metrics differ between the two refs."
+            : "Structurally identical between the two refs.";
+        cmpSec.appendChild(cmpNote);
+        pb.appendChild(cmpSec);
       }
 
       // Linked work

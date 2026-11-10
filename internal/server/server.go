@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/taikuri-infra/observer/internal/atref"
 	"github.com/taikuri-infra/observer/internal/gitmeta"
 	"github.com/taikuri-infra/observer/internal/manifest"
 	"github.com/taikuri-infra/observer/internal/runner"
@@ -64,6 +65,7 @@ func New(repo, base, token string) http.Handler {
 	mux.HandleFunc("/api/artifact", s.requireToken(s.handleArtifact))
 	mux.HandleFunc("/api/gitrefs", s.requireToken(s.handleGitRefs))
 	mux.HandleFunc("/api/gitdiff", s.requireToken(s.handleGitDiff))
+	mux.HandleFunc("/api/graphat", s.requireToken(s.handleGraphAt))
 	mux.HandleFunc("/web/", s.handleWebAsset)
 	mux.HandleFunc("/", s.handleIndex)
 	// Wrap every route with a Host allowlist so a DNS-rebinding page (an
@@ -440,6 +442,54 @@ func (s *Server) handleGitDiff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, gitDiffResponse{Base: base, BaseResolved: baseResolved, Files: files})
+}
+
+// handleGraphAt serves GET /api/graphat?tab=<name>&ref=<ref>: tab's
+// graph.json AS IT EXISTED at ref (branch/tag/commit), not necessarily the
+// current working tree — the data source for the "View a branch"/"Compare
+// two refs" UI. ref is optional: "" or "working" means the current working
+// tree (the fast path — no worktree, no cache, same generator run
+// /api/update already does). Any other ref is resolved+validated and
+// built/cached by internal/atref. Read-only like /api/artifact, so it
+// doesn't require the X-Observer CSRF header — only R15's mutating POST
+// /api/update does.
+func (s *Server) handleGraphAt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	tabName := r.URL.Query().Get("tab")
+	if tabName == "" {
+		http.Error(w, "missing required ?tab= query param", http.StatusBadRequest)
+		return
+	}
+	ref := r.URL.Query().Get("ref")
+	proj, err := s.loadManifest()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err)
+		return
+	}
+	tab, ok := findTab(proj, tabName)
+	if !ok {
+		http.Error(w, fmt.Sprintf("unknown tab %q", tabName), http.StatusNotFound)
+		return
+	}
+	if tab.Kind != manifest.KindGenerator {
+		http.Error(w, fmt.Sprintf("tab %q has no generator to build at a ref", tabName), http.StatusBadRequest)
+		return
+	}
+	body, err := atref.GraphAtRef(s.repo, tab, ref)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, atref.ErrInvalidRef) {
+			status = http.StatusBadRequest
+		}
+		writeJSONError(w, status, err)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeFor(tab.Renderer))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 func contentTypeFor(renderer string) string {
