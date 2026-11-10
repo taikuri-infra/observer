@@ -57,6 +57,17 @@ dockers:
     image_templates:
       - "ghcr.io/taikuri-infra/observer:{{ .Version }}-amd64"
     use: buildx
+    # The Dockerfile is a from-source multi-stage build (it compiles both
+    # observer and go-callvis), so GoReleaser's otherwise-minimal docker
+    # build context must also carry the Go source it COPYs: go.mod/go.sum +
+    # cmd/ + internal/ for the observer binary, and tools/ (its pinned
+    # go.mod/go.sum) for the go-callvis toolbuilder stage.
+    extra_files:
+      - go.mod
+      - go.sum
+      - cmd
+      - internal
+      - tools
     build_flag_templates:
       - "--platform=linux/amd64"
       - "--label=org.opencontainers.image.version={{ .Version }}"
@@ -70,6 +81,14 @@ dockers:
     image_templates:
       - "ghcr.io/taikuri-infra/observer:{{ .Version }}-arm64"
     use: buildx
+    # See observer-amd64: the from-source Dockerfile needs the Go source in
+    # the docker build context.
+    extra_files:
+      - go.mod
+      - go.sum
+      - cmd
+      - internal
+      - tools
     build_flag_templates:
       - "--platform=linux/arm64"
       - "--label=org.opencontainers.image.version={{ .Version }}"
