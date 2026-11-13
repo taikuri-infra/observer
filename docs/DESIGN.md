@@ -4,8 +4,10 @@
 > One container, many projects. Generated artifacts are committed to each repo
 > so your architecture has a **git history** you can diff across versions.
 
-Status: **design approved** (2026-11-08). This document is the source of truth
-for v1. See [Roadmap](#roadmap) for v2+.
+Status: **design approved** (2026-11-08), **synced to as-built** (2026-11-13).
+This document is the source of truth for v1 and tracks what actually shipped —
+the tab set (§4), data flow (§5) and roadmap (§9) reflect the current `main`.
+See [Roadmap](#roadmap) for what's next.
 
 ---
 
@@ -31,9 +33,10 @@ fit an EU-hosted / no-vendor posture.
 
 - Not a hosted SaaS, not a team portal (that's Backstage's job).
 - Not a replacement for the underlying tools — it **orchestrates** them.
-- v1 does not include the heavy "service" tools (Sourcegraph, Azimutt) or the
-  cross-version diff view — those are v2 (see Roadmap), but v1 commits the
-  snapshots they'll diff.
+- v1 does not include the heavy "service" tools (Sourcegraph, Azimutt) — those
+  are v2 (see Roadmap). (The cross-version diff view was originally scoped to v2
+  but shipped early in v1: every map tab has a git-diff overlay and an atref
+  "View / Compare across git refs" time-travel control — see §4 and §9.)
 
 ## 3. Architecture
 
@@ -75,25 +78,26 @@ Only lightweight analyses (git changes, ER-from-SQL parsing) are native Go.
 A plugin is one tab. Three kinds (v1 ships `generator` only):
 
 ```yaml
-# <repo>/obs-data/observer.yaml  — per-project, committed
+# <repo>/obs-data/observer.yaml  — per-project, committed.
+# `observer init` auto-detects Go modules + migrations dirs and writes this
+# whole file for you; it's shown here only to illustrate the shape.
 project: servicePlus
 tabs:
-  - name: Changes
+  - name: AI context
     kind: generator
-    command: "observer-gen changes --base main"   # built-in generators
-    output: changes.md
+    command: "observer gen contextpack --dir services/api --out obs-data/context.md"
+    output: context.md
     renderer: markdown
-  - name: Call graph
+  - name: Service map
     kind: generator
-    command: "go-callvis -focus chat -format svg -file obs-data/callgraph ./services/api/cmd/api"
-    output: callgraph.svg
-    renderer: svg
-    requires: [go-callvis]
+    command: "observer gen graphmodel --dir services/api --out obs-data/map.json"
+    output: map.json
+    renderer: canvas
   - name: Database
     kind: generator
-    command: "observer-gen er --migrations services/api/internal/adapters/postgres/tenant_migrations"
-    output: er.dbml
-    renderer: dbml
+    command: "observer gen er --migrations services/api/internal/adapters/postgres/tenant_migrations --dbml-out obs-data/er.dbml --json-out obs-data/er-map.json"
+    output: er-map.json
+    renderer: canvas
   # v2:
   # - name: Code Search ; kind: service ; start: "docker ..." ; url: http://localhost:7080
   # - name: Hotspots (CodeScene) ; kind: link ; url: https://codescene.io/...
@@ -105,18 +109,33 @@ tabs:
 
 `requires:` lists host/image tools; `observer doctor` reports what's missing.
 
-### v1 tabs (all local generators)
+### v1 tabs (the built-in, deliberately LEAN default set)
 
-| Tab | Tool | Output | Renderer |
+`observer init` emits this set, highest-signal first. All are **native Go
+generators** (no external analyzer needed), detected per Go module / migrations
+dir. Every map tab also carries a **git-diff overlay** (changed nodes
+highlighted) and an **atref "View / Compare across git refs"** time-travel
+control (§9).
+
+| Tab | Generator | Output | Renderer |
 |---|---|---|---|
-| Overview | native | index.md (freshness, counts) | markdown |
-| Changes since main | native git | changes.md | markdown |
-| Database (ER) | native SQL parser → DBML | er.dbml | dbml→svg |
-| Go deps | native (`go list`) / goda | deps.svg | svg |
-| Go call graph | go-callvis | callgraph.svg | svg |
-| Frontend deps | dependency-cruiser | web-deps.json/svg | svg |
-| Evolution / hotspots | code-maat (git log) | hotspots.json | table/chart |
-| Knowledge graph | graphify | graph.json | graph |
+| Overview | `observer gen overview` | index.md (freshness, counts) | markdown |
+| AI context | `observer gen contextpack` | context.md (paste-ready repo brief) | markdown |
+| Service map | `observer gen graphmodel` | map.json (Go pkg deps + churn↔coverage overlay) | canvas |
+| Changes | `observer gen changedgraph` | changes-map.json (map, changed pkgs highlighted) | canvas |
+| What changed | `observer gen whatchanged` | whatchanged.md (textual review digest) | markdown |
+| API routes | `observer gen apiroutes` | api-routes.json (Fiber route table, per module) | canvas |
+| Database (ER) | `observer gen er` | er.dbml + er-map.json (ER canvas) | canvas/dbml |
+| TODOs | `observer gen todos` | todos.json (marker scan) | table |
+| Hotspots | `observer gen hotspots` | hotspots.json (git churn) | table |
+
+**Removed 2026-11** (now CLI-only, not default tabs): the per-main-package **Go
+call graph** (`observer gen callgraphmodel`) and per-frontend-package **Frontend
+deps** (`observer gen frontendmodel`) — a whole-binary function call graph is a
+dense hairball the package Service map already answers at a readable altitude,
+and both fanned out to one tab per app and errored without go-callvis /
+dependency-cruiser installed. The generators remain for anyone who wants to run
+one by hand. (Knowledge-graph / graphify is likewise not a default tab.)
 
 ## 5. Data & git flow
 
@@ -152,13 +171,21 @@ GHCR on tag), `release.yml` (**goreleaser** → cross-platform wrapper + GHCR im
 
 ## 9. Roadmap
 
-- **v1 (now):** engine + local generator tabs above; snapshots committed.
+- **v1 (now):** engine + the lean native generator tabs above; snapshots
+  committed. **Cross-version diff shipped early** (pulled forward from v2): every
+  map tab has a git-diff overlay plus an **atref "View / Compare across git
+  refs"** control that rebuilds any tab's graph as it existed at an arbitrary
+  ref (via a throwaway git worktree) — "what did this look like at v0.1.0?"
+  without leaving the dashboard. This is the differentiator, and it's why v1
+  commits snapshots from day one.
 - **v2:** `service` tabs (Sourcegraph, Azimutt via Docker iframe); `link` tabs
-  (CodeScene cloud); **version diff** — compare committed `obs-data/` snapshots
-  across tags/branches ("what changed between v0.1.0 and v0.2.0"). This is the
-  differentiator and is why v1 commits snapshots from day one.
+  (CodeScene cloud); `observer refresh` (headless regen of every tab) + a
+  stale-vs-HEAD badge + a git post-commit hook, so committed artifacts never
+  rot; `observer diff --base main` as a semantic artifact diff with a CI exit
+  code; architecture `rules.yaml` (forbidden-edge / layer gates).
 - **v3:** Python toolchain; `observer init --detect` auto-wiring; multi-repo
-  overview; optional publish to a static site.
+  overview; agent-facing delivery (MCP server / documented `--stdout` contract);
+  optional publish to a static site.
 
 ## 10. Open-source launch checklist (post-build)
 
